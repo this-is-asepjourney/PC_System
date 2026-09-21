@@ -1,0 +1,24 @@
+app:
+  name: "PC-System Monitor"
+  version: "0.1.0"
+  debug: true
+
+monitoring:
+  intervals:
+    cpu: 1.0
+    memory: 1.0
+    disk: 2.0
+    network: 1.0
+    process: 2.0
+    hardware: 3.0
+    database: 5.0
+
+alerts:
+  thresholds:
+    cpu: 90.0
+    memory: 90.0
+    disk: 90.0
+
+database:
+  path: "data/pc_system.db"
+  retention_days: 7
