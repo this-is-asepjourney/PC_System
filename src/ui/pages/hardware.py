@@ -43,9 +43,17 @@ class HardwarePage(QWidget):
         # Battery
         batt = data.get("battery")
         if batt:
-            lines.append("🔋 <b>Battery</b>")
+            lines.append("🔋 <b>System Battery</b>")
             lines.append(f"Level: {batt['percent']}%")
             lines.append(f"Plugged In: {'Yes' if batt['power_plugged'] else 'No'}")
+            lines.append("")
+            
+        # Bluetooth Batteries
+        bt_batts = data.get("bluetooth_batteries", [])
+        if bt_batts:
+            lines.append("🖱️ <b>Bluetooth Devices Battery</b>")
+            for bt in bt_batts:
+                lines.append(f"{bt.get('Name', 'Unknown Device')}: {bt.get('Battery', 0)}%")
             lines.append("")
             
         # Temperatures
