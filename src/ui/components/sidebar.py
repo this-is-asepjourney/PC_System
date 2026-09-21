@@ -25,7 +25,8 @@ class Sidebar(QFrame):
         self._add_nav_button("Dashboard", "dashboard")
         self._add_nav_button("Processes", "processes")
         self._add_nav_button("Hardware", "hardware")
-        self._add_nav_button("Alerts", "alerts")
+        self._add_nav_button("Analyze", "analyze")
+        self._add_nav_button("Optimizer", "optimizer")
         self._add_nav_button("Settings", "settings")
         
         self.layout.addStretch()

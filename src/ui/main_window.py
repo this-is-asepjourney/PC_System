@@ -6,6 +6,8 @@ from src.ui.pages.processes import ProcessesPage
 from src.ui.pages.hardware import HardwarePage
 from src.ui.pages.alerts import AlertsPage
 from src.ui.pages.settings import SettingsPage
+from src.ui.pages.optimizer import OptimizerPage
+from src.ui.pages.analyze import AnalyzePage
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -38,6 +40,8 @@ class MainWindow(QMainWindow):
         self._add_page("processes", ProcessesPage())
         self._add_page("hardware", HardwarePage())
         self._add_page("alerts", AlertsPage())
+        self._add_page("analyze", AnalyzePage())
+        self._add_page("optimizer", OptimizerPage())
         self._add_page("settings", SettingsPage())
         
         # Initial page
