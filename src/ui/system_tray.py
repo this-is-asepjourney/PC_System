@@ -29,6 +29,10 @@ class SystemTray(QSystemTrayIcon):
         self.mini_action.triggered.connect(self.show_mini)
         self.menu.addAction(self.mini_action)
         
+        self.taskbar_action = QAction("Open Taskbar Mode")
+        self.taskbar_action.triggered.connect(self.show_taskbar)
+        self.menu.addAction(self.taskbar_action)
+        
         self.menu.addSeparator()
         
         self.quit_action = QAction("Exit")
@@ -46,14 +50,26 @@ class SystemTray(QSystemTrayIcon):
     def show_window(self):
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.hide()
+        if hasattr(self.main_window, "taskbar_widget"):
+            self.main_window.taskbar_widget.hide()
         self.main_window.show()
         self.main_window.activateWindow()
         
     def show_mini(self):
         self.main_window.hide()
+        if hasattr(self.main_window, "taskbar_widget"):
+            self.main_window.taskbar_widget.hide()
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.show()
             self.main_window.mini_widget.activateWindow()
+
+    def show_taskbar(self):
+        self.main_window.hide()
+        if hasattr(self.main_window, "mini_widget"):
+            self.main_window.mini_widget.hide()
+        if hasattr(self.main_window, "taskbar_widget"):
+            self.main_window.taskbar_widget.show()
+            self.main_window.taskbar_widget.activateWindow()
         
     def quit_app(self):
         self.app.quit()

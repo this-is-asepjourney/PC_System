@@ -21,6 +21,10 @@ def main(app: QApplication):
     app.mini_widget = MiniWidget(app.window)
     app.window.mini_widget = app.mini_widget # give window access to it
     
+    from src.ui.taskbar_widget import TaskbarWidget
+    app.taskbar_widget = TaskbarWidget(app.window)
+    app.window.taskbar_widget = app.taskbar_widget
+    
     # Initialize System Tray
     app.setQuitOnLastWindowClosed(False)
     app.window.tray = SystemTray(app.window, app)

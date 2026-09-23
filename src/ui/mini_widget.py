@@ -6,6 +6,8 @@ class MiniBridge(QObject):
     cpu_updated = Signal(dict)
     memory_updated = Signal(dict)
     network_updated = Signal(dict)
+    disk_updated = Signal(dict)
+    hardware_updated = Signal(dict)
 
 class MiniWidget(QWidget):
     def __init__(self, main_window):
@@ -13,9 +15,9 @@ class MiniWidget(QWidget):
         self.main_window = main_window
         
         # Window attributes for a widget
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(250, 120)
+        self.resize(250, 150)
         
         # We need variables for dragging
         self._drag_pos = QPoint()
@@ -67,21 +69,30 @@ class MiniWidget(QWidget):
         # Metrics labels
         self.lbl_cpu = QLabel("CPU: --")
         self.lbl_ram = QLabel("RAM: --")
+        self.lbl_disk = QLabel("Disk: --")
         self.lbl_net = QLabel("Net: ↓ -- ↑ --")
         
-        for lbl in [self.lbl_cpu, self.lbl_ram, self.lbl_net]:
+        for lbl in [self.lbl_cpu, self.lbl_ram, self.lbl_disk, self.lbl_net]:
             lbl.setStyleSheet("font-size: 12px; border: none; background: transparent;")
             inner_layout.addWidget(lbl)
+            
+        self._cpu_temp = "--"
+        self._ram_temp = "--"
+        self._disk_temp = "--"
             
         # Bridge setup
         self.bridge = MiniBridge()
         self.bridge.cpu_updated.connect(self.update_cpu)
         self.bridge.memory_updated.connect(self.update_memory)
         self.bridge.network_updated.connect(self.update_network)
+        self.bridge.disk_updated.connect(self.update_disk)
+        self.bridge.hardware_updated.connect(self.update_hardware)
         
         event_bus.subscribe("metrics_cpu", self.bridge.cpu_updated.emit)
         event_bus.subscribe("metrics_memory", self.bridge.memory_updated.emit)
         event_bus.subscribe("metrics_network", self.bridge.network_updated.emit)
+        event_bus.subscribe("metrics_disk", self.bridge.disk_updated.emit)
+        event_bus.subscribe("metrics_hardware", self.bridge.hardware_updated.emit)
 
     def restore_main(self):
         self.hide()
@@ -100,12 +111,28 @@ class MiniWidget(QWidget):
             event.accept()
             
     # Updaters
+    def update_hardware(self, data: dict):
+        temps = data.get("temperatures", {})
+        if "cpu" in temps and temps["cpu"]:
+            self._cpu_temp = f"{temps['cpu'][0]['current']}°C"
+        if "ram" in temps and temps["ram"]:
+            self._ram_temp = f"{temps['ram'][0]['current']}°C"
+        if "disk" in temps and temps["disk"]:
+            self._disk_temp = f"{temps['disk'][0]['current']}°C"
+
     def update_cpu(self, data: dict):
-        self.lbl_cpu.setText(f"CPU: {data['usage']:.1f}%")
+        self.lbl_cpu.setText(f"CPU: {data['usage']:.1f}%  |  Temp: {self._cpu_temp}")
         
     def update_memory(self, data: dict):
-        self.lbl_ram.setText(f"RAM: {data['percent']:.1f}%")
+        self.lbl_ram.setText(f"RAM: {data['percent']:.1f}%  |  Temp: {self._ram_temp}")
         
+    def update_disk(self, data: dict):
+        partitions = data.get("partitions", [])
+        if partitions:
+            self.lbl_disk.setText(f"Disk: {partitions[0]['percent']:.1f}%  |  Temp: {self._disk_temp}")
+        else:
+            self.lbl_disk.setText(f"Disk: --  |  Temp: {self._disk_temp}")
+
     def update_network(self, data: dict):
         dl_mb = data['download_speed'] / (1024**2)
         ul_mb = data['upload_speed'] / (1024**2)
