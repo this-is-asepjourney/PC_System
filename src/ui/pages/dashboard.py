@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal, QObject
 from src.ui.components.metric_card import MetricCard
 from src.ui.components.performance_chart import PerformanceChart
@@ -20,9 +20,30 @@ class DashboardPage(QWidget):
         layout.setSpacing(20)
         
         # Header
+        header_layout = QHBoxLayout()
         header = QLabel("Dashboard")
         header.setStyleSheet("font-size: 28px; font-weight: bold; color: #cdd6f4;")
-        layout.addWidget(header)
+        header_layout.addWidget(header)
+        
+        header_layout.addStretch()
+        
+        self.btn_taskbar_mode = QPushButton("Taskbar Mode")
+        self.btn_taskbar_mode.setStyleSheet("""
+            QPushButton {
+                background-color: #313244;
+                color: #cdd6f4;
+                border: 1px solid #45475a;
+                border-radius: 4px;
+                padding: 5px 15px;
+            }
+            QPushButton:hover {
+                background-color: #45475a;
+            }
+        """)
+        self.btn_taskbar_mode.clicked.connect(self.open_taskbar_mode)
+        header_layout.addWidget(self.btn_taskbar_mode)
+        
+        layout.addLayout(header_layout)
         
         # Cards grid
         cards_layout = QGridLayout()
@@ -78,3 +99,8 @@ class DashboardPage(QWidget):
         dl_mb = data['download_speed'] / (1024**2)
         ul_mb = data['upload_speed'] / (1024**2)
         self.net_card.set_value(f"↓ {dl_mb:.1f} MB/s", f"↑ {ul_mb:.1f} MB/s")
+
+    def open_taskbar_mode(self):
+        window = self.window()
+        if hasattr(window, 'tray'):
+            window.tray.show_taskbar()

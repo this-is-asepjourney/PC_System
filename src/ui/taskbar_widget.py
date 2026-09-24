@@ -19,11 +19,11 @@ class TaskbarWidget(QWidget):
         self.bg_frame = QWidget()
         self.bg_frame.setStyleSheet("""
             QWidget {
-                background-color: rgba(20, 20, 30, 240);
-                border-radius: 4px;
-                border: 1px solid #313244;
-                color: #cdd6f4;
+                background-color: rgba(0, 0, 0, 180);
+                border-radius: 6px;
+                color: #ffffff;
                 font-family: 'Segoe UI', Arial;
+                font-weight: bold;
             }
         """)
         layout.addWidget(self.bg_frame)
@@ -75,6 +75,36 @@ class TaskbarWidget(QWidget):
             self.hide()
             self.main_window.show()
             self.main_window.activateWindow()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Position after the widget has been shown and size is calculated
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(10, self.position_in_taskbar)
+
+    def position_in_taskbar(self):
+        screen = self.screen()
+        if not screen:
+            from PySide6.QtGui import QGuiApplication
+            screen = QGuiApplication.primaryScreen()
+            
+        geom = screen.geometry()
+        avail = screen.availableGeometry()
+        
+        # Calculate taskbar height (assuming bottom taskbar)
+        taskbar_height = geom.height() - avail.height()
+        if taskbar_height <= 0:
+            taskbar_height = 40 # fallback
+            
+        # Target position as a floating overlay
+        target_x = avail.width() - self.width() - 350
+        target_y = geom.height() - taskbar_height + (taskbar_height - self.height()) // 2
+        
+        # Ensure it's not below screen
+        if target_y + self.height() > geom.height():
+            target_y = geom.height() - self.height()
+            
+        self.move(target_x, target_y)
 
     # Updaters
     def update_hardware(self, data: dict):
