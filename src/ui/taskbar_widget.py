@@ -12,6 +12,12 @@ class TaskbarWidget(QWidget):
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         
+        # Keep-on-top timer
+        from PySide6.QtCore import QTimer
+        self.top_timer = QTimer(self)
+        self.top_timer.timeout.connect(self._ensure_on_top)
+        self.top_timer.start(2000)
+        
         # Horizontal layout
         layout = QHBoxLayout(self)
         layout.setContentsMargins(5, 2, 5, 2)
@@ -68,6 +74,10 @@ class TaskbarWidget(QWidget):
         if event.buttons() == Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
+            
+    def _ensure_on_top(self):
+        if self.isVisible():
+            self.raise_()
             
     def mouseDoubleClickEvent(self, event):
         # Double click to restore main window

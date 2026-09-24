@@ -15,9 +15,15 @@ class MiniWidget(QWidget):
         self.main_window = main_window
         
         # Window attributes for a widget
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.resize(250, 150)
+        
+        # Keep-on-top timer
+        from PySide6.QtCore import QTimer
+        self.top_timer = QTimer(self)
+        self.top_timer.timeout.connect(self._ensure_on_top)
+        self.top_timer.start(2000)
         
         # We need variables for dragging
         self._drag_pos = QPoint()
@@ -109,6 +115,10 @@ class MiniWidget(QWidget):
         if event.buttons() == Qt.LeftButton:
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             event.accept()
+            
+    def _ensure_on_top(self):
+        if self.isVisible():
+            self.raise_()
             
     # Updaters
     def update_hardware(self, data: dict):

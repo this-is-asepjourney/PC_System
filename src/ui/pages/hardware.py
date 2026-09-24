@@ -72,6 +72,25 @@ class HardwarePage(QWidget):
             for name, entries in fans.items():
                 for entry in entries:
                     lines.append(f"{name} ({entry.label}): {entry.current} RPM")
+            lines.append("")
+
+        # Connected Devices
+        connected_devices = data.get("connected_devices", [])
+        if connected_devices:
+            lines.append("🔌 <b>Connected Devices</b>")
+            
+            # Group by Class or just list them
+            # We'll list them sorted by status (OK first, then others)
+            # Actually just list all
+            for dev in connected_devices:
+                name = dev.get("Name", "Unknown")
+                status = dev.get("Status", "Unknown")
+                cls = dev.get("Class", "")
+                
+                status_icon = "🟢" if status == "OK" else "🔴"
+                lines.append(f"{status_icon} <b>{name}</b> ({cls}) - {status}")
+                
+            lines.append("")
                     
         if not lines:
             self.info_label.setText("No hardware sensors available on this system natively via psutil.")

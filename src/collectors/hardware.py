@@ -72,5 +72,32 @@ class HardwareCollector(BaseCollector):
                 sensors["bluetooth_batteries"] = []
         except Exception:
             sensors["bluetooth_batteries"] = []
+
+        # Connected Devices (USB, Bluetooth, Audio, etc.)
+        try:
+            ps_script_devices = """
+            $devices = Get-PnpDevice -Class Bluetooth,USB,Mouse,Keyboard,AudioEndpoint -ErrorAction SilentlyContinue | Select-Object FriendlyName, Status, Class
+            $results = @()
+            foreach ($dev in $devices) {
+                if ($null -ne $dev.FriendlyName -and $dev.FriendlyName.Trim() -ne "") {
+                    $results += @{ Name = $dev.FriendlyName; Status = $dev.Status; Class = $dev.Class }
+                }
+            }
+            $results | ConvertTo-Json -Compress
+            """
+            result_devices = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script_devices],
+                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            
+            if result_devices.stdout.strip():
+                dev_data = json.loads(result_devices.stdout.strip())
+                if isinstance(dev_data, dict):
+                    dev_data = [dev_data]
+                sensors["connected_devices"] = dev_data
+            else:
+                sensors["connected_devices"] = []
+        except Exception:
+            sensors["connected_devices"] = []
                 
         return sensors
