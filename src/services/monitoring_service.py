@@ -30,6 +30,8 @@ class MonitoringService:
         # State for computing speeds (network/disk)
         self._last_net_io = None
         self._last_net_time = None
+        self._last_disk_io = None
+        self._last_disk_time = None
         
         # Latest metrics cache for DB
         self._latest_metrics = {
@@ -101,6 +103,23 @@ class MonitoringService:
         
     def _collect_disk(self):
         data = self.disk_collector.collect()
+        current_time = time.time()
+        
+        if self._last_disk_io and self._last_disk_time:
+            dt = current_time - self._last_disk_time
+            if dt > 0:
+                data["read_speed"] = max(0.0, (data["io_read_bytes"] - self._last_disk_io["io_read_bytes"]) / dt)
+                data["write_speed"] = max(0.0, (data["io_write_bytes"] - self._last_disk_io["io_write_bytes"]) / dt)
+            else:
+                data["read_speed"] = 0.0
+                data["write_speed"] = 0.0
+        else:
+            data["read_speed"] = 0.0
+            data["write_speed"] = 0.0
+            
+        self._last_disk_io = {"io_read_bytes": data["io_read_bytes"], "io_write_bytes": data["io_write_bytes"]}
+        self._last_disk_time = current_time
+
         # For disk_usage we can use C: drive or the first partition for simplicity in the general metric
         if data["partitions"]:
             self._latest_metrics["disk_usage"] = data["partitions"][0]["percent"]
