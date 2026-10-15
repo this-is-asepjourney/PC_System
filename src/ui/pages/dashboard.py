@@ -125,6 +125,8 @@ class DashboardPage(QWidget):
         event_bus.subscribe("metrics_hardware", self.bridge.hardware_updated.emit)
 
     def update_hardware(self, data: dict):
+        if not self.isVisible():
+            return
         temps = data.get("temperatures", {})
         if "cpu" in temps and temps["cpu"]:
             curr = getattr(temps["cpu"][0], "current", temps["cpu"][0].get("current") if isinstance(temps["cpu"][0], dict) else 0)
@@ -142,6 +144,8 @@ class DashboardPage(QWidget):
             self.disk_card.set_temp(self._disk_temp)
 
     def update_cpu(self, data: dict):
+        if not self.isVisible():
+            return
         usage = data['usage']
         freq = data.get('frequency', 0)
         sub = f"{freq:.0f} MHz" if freq > 0 else "Active"
@@ -149,12 +153,16 @@ class DashboardPage(QWidget):
         self.cpu_chart.update_value(usage)
         
     def update_memory(self, data: dict):
+        if not self.isVisible():
+            return
         pct = data['percent']
         total_gb = data['total'] / (1024**3)
         used_gb = data['used'] / (1024**3)
         self.ram_card.set_value(f"{pct:.1f}%", subvalue=f"{used_gb:.1f} / {total_gb:.1f} GB", percent=pct, temp=self._ram_temp)
         
     def update_disk(self, data: dict):
+        if not self.isVisible():
+            return
         if data.get('partitions'):
             p = data['partitions'][0]
             pct = p['percent']
@@ -168,6 +176,8 @@ class DashboardPage(QWidget):
             self.disk_card.set_value(f"{pct:.1f}%", subvalue=f"{used_gb:.1f} / {total_gb:.1f} GB{io_info}", percent=pct, temp=self._disk_temp)
             
     def update_network(self, data: dict):
+        if not self.isVisible():
+            return
         dl_bps = data.get('download_speed', 0.0)
         ul_bps = data.get('upload_speed', 0.0)
         

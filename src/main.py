@@ -1,3 +1,4 @@
+import sys
 import logging
 from PySide6.QtWidgets import QApplication
 from src.core.logger import logger
@@ -30,7 +31,14 @@ def main(app: QApplication):
     app.window.tray = SystemTray(app.window, app)
     app.window.tray.show()
     
-    app.window.show()
+    if "--taskbar" in sys.argv:
+        app.taskbar_widget.show()
+        app.taskbar_widget.activateWindow()
+    elif "--mini" in sys.argv:
+        app.mini_widget.show()
+        app.mini_widget.activateWindow()
+    else:
+        app.window.show()
     
     # Let the app run, but ensure we stop services on exit
     app.aboutToQuit.connect(app.monitoring_service.stop)

@@ -1,15 +1,25 @@
+import time
 import psutil
 from src.collectors.base import BaseCollector
 from typing import Dict, Any
 
 class DiskCollector(BaseCollector):
+    def __init__(self):
+        super().__init__()
+        self._cached_partitions = []
+        self._last_partitions_time = 0.0
+
     def collect(self) -> Dict[str, Any]:
-        partitions = psutil.disk_partitions(all=False)
+        now = time.time()
+        if not self._cached_partitions or (now - self._last_partitions_time > 60.0):
+            try:
+                self._cached_partitions = psutil.disk_partitions(all=False)
+            except Exception:
+                self._cached_partitions = []
+            self._last_partitions_time = now
+
+        partitions = self._cached_partitions
         disks_data = []
-        
-        # To calculate read/write speeds, we would need to store previous state.
-        # For simplicity in collect(), we just return current counters.
-        # The service layer or UI can compute the delta if needed.
         io_counters = psutil.disk_io_counters()
         
         for p in partitions:

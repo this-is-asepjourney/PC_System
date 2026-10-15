@@ -34,10 +34,11 @@ class HardwareCollector(BaseCollector):
         # Kick off initial background scan once
         self._trigger_background_device_scan()
 
-    def _trigger_background_device_scan(self):
+    def _trigger_background_device_scan(self, force: bool = False):
         now = time.time()
-        # Scan at most once every 60 seconds
-        if self._scan_in_progress or (now - self._last_device_scan < 60.0):
+        # Scan at most once every 10 minutes unless forced
+        interval = 600.0 if not force else 5.0
+        if self._scan_in_progress or (now - self._last_device_scan < interval):
             return
             
         self._scan_in_progress = True
@@ -63,7 +64,7 @@ class HardwareCollector(BaseCollector):
             """
             result_bt = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script_bt],
-                capture_output=True, text=True, timeout=4, creationflags=subprocess.CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
             )
             if result_bt.stdout.strip():
                 bt_data = json.loads(result_bt.stdout.strip())
@@ -84,7 +85,7 @@ class HardwareCollector(BaseCollector):
             """
             result_dev = subprocess.run(
                 ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script_devices],
-                capture_output=True, text=True, timeout=4, creationflags=subprocess.CREATE_NO_WINDOW
+                capture_output=True, text=True, timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
             )
             if result_dev.stdout.strip():
                 dev_data = json.loads(result_dev.stdout.strip())
@@ -118,7 +119,7 @@ class HardwareCollector(BaseCollector):
         except Exception:
             pass
 
-        # 2. Physics-inspired dynamic thermal estimation based on real live CPU/RAM usage
+        # 2. Physics-inspired dynamic thermal estimation based on live CPU/RAM usage
         import random
         try:
             cpu_usage = psutil.cpu_percent(interval=None) or 15.0
@@ -127,18 +128,15 @@ class HardwareCollector(BaseCollector):
             cpu_usage = 15.0
             ram_percent = 40.0
 
-        # Dynamic target temperatures
         target_cpu = 38.0 + (cpu_usage / 100.0) * 40.0
         target_ram = 34.0 + (ram_percent / 100.0) * 14.0
         target_disk = 32.0 + (cpu_usage / 100.0) * 10.0
 
-        # Low-pass filter (thermal inertia) with minor ambient micro-fluctuation
-        jitter = random.uniform(-0.25, 0.25)
-        self._cpu_temp = round(self._cpu_temp * 0.80 + target_cpu * 0.20 + jitter, 1)
-        self._ram_temp = round(self._ram_temp * 0.88 + target_ram * 0.12 + (jitter * 0.4), 1)
-        self._disk_temp = round(self._disk_temp * 0.92 + target_disk * 0.08 + (jitter * 0.3), 1)
+        jitter = random.uniform(-0.15, 0.15)
+        self._cpu_temp = round(self._cpu_temp * 0.82 + target_cpu * 0.18 + jitter, 1)
+        self._ram_temp = round(self._ram_temp * 0.90 + target_ram * 0.10, 1)
+        self._disk_temp = round(self._disk_temp * 0.94 + target_disk * 0.06, 1)
 
-        # Boundaries
         self._cpu_temp = max(35.0, min(95.0, self._cpu_temp))
         self._ram_temp = max(30.0, min(65.0, self._ram_temp))
         self._disk_temp = max(28.0, min(60.0, self._disk_temp))
@@ -151,11 +149,8 @@ class HardwareCollector(BaseCollector):
 
     def collect(self) -> Dict[str, Any]:
         sensors = {}
-        
-        # Temperatures
         sensors["temperatures"] = self._get_temperatures()
                 
-        # Fans
         if hasattr(psutil, "sensors_fans"):
             try:
                 sensors["fans"] = psutil.sensors_fans()
@@ -164,28 +159,19 @@ class HardwareCollector(BaseCollector):
         else:
             sensors["fans"] = {}
                 
-        # Battery
         if hasattr(psutil, "sensors_battery"):
             try:
                 batt = psutil.sensors_battery()
-                if batt:
-                    sensors["battery"] = {
-                        "percent": batt.percent,
-                        "power_plugged": batt.power_plugged,
-                        "secsleft": batt.secsleft
-                    }
-                else:
-                    sensors["battery"] = None
+                sensors["battery"] = {
+                    "percent": batt.percent,
+                    "power_plugged": batt.power_plugged,
+                    "secsleft": batt.secsleft
+                } if batt else None
             except Exception:
                 sensors["battery"] = None
         else:
             sensors["battery"] = None
                 
-        # Non-blocking cached bluetooth & devices
         sensors["bluetooth_batteries"] = self._cached_bluetooth_batteries
         sensors["connected_devices"] = self._cached_connected_devices
-        
-        # Check if cache needs background update
-        self._trigger_background_device_scan()
-                
         return sensors

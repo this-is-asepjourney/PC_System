@@ -1,0 +1,12 @@
+{
+  "opacity": 0.92,
+  "locked": false,
+  "dock_preset": "custom",
+  "saved_x": 1373,
+  "saved_y": 1042,
+  "show_temps": true,
+  "show_disk": true,
+  "show_net": true,
+  "show_battery": true,
+  "view_mode": "dual_row"
+}

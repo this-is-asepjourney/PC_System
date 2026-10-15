@@ -53,9 +53,9 @@ class MonitoringService:
         self._start_worker("memory", self.intervals.get('memory', 1.0), self._collect_memory)
         self._start_worker("disk", self.intervals.get('disk', 2.0), self._collect_disk)
         self._start_worker("network", self.intervals.get('network', 1.0), self._collect_network)
-        self._start_worker("process", self.intervals.get('process', 2.0), self._collect_process)
+        self._start_worker("process", self.intervals.get('process', 4.0), self._collect_process)
         self._start_worker("hardware", self.intervals.get('hardware', 3.0), self._collect_hardware)
-        self._start_worker("database", self.intervals.get('database', 5.0), self._save_metrics)
+        self._start_worker("database", self.intervals.get('database', 10.0), self._save_metrics)
 
     def stop(self):
         self._running = False
