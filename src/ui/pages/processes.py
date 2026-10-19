@@ -61,8 +61,8 @@ class ProcessesPage(QWidget):
         event_bus.subscribe("metrics_process", self.bridge.process_updated.emit)
         
     def update_table(self, data: dict):
-        # In a real app we'd smartly update existing rows. For now, clear and rebuild if simple enough.
-        # To avoid losing selection, we remember it.
+        if not self.isVisible():
+            return
         processes = data.get("processes", [])
         
         # Filter if search

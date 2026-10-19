@@ -54,8 +54,20 @@ class MainWindow(QMainWindow):
     def change_page(self, page_id: str):
         if page_id in self.pages:
             self.content_area.setCurrentWidget(self.pages[page_id])
+            from PySide6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if hasattr(app, "monitoring_service"):
+                app.monitoring_service.set_process_monitoring_active(page_id == "processes")
             
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if hasattr(app, "monitoring_service"):
+            app.monitoring_service.set_process_monitoring_active(False)
+
     def closeEvent(self, event):
         # Minimize to tray instead of closing
         event.ignore()
         self.hide()
+

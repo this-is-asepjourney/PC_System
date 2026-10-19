@@ -30,11 +30,8 @@ class HardwareCollector(BaseCollector):
         self._cached_connected_devices: List[Dict[str, Any]] = []
         self._last_device_scan = 0.0
         self._scan_in_progress = False
-        
-        # Kick off initial background scan once
-        self._trigger_background_device_scan()
 
-    def _trigger_background_device_scan(self, force: bool = False):
+    def trigger_background_device_scan(self, force: bool = False):
         now = time.time()
         # Scan at most once every 10 minutes unless forced
         interval = 600.0 if not force else 5.0
@@ -99,7 +96,7 @@ class HardwareCollector(BaseCollector):
             self._last_device_scan = time.time()
             self._scan_in_progress = False
 
-    def _get_temperatures(self) -> Dict[str, List[SensorReading]]:
+    def _get_temperatures(self, cpu_usage: float = None, ram_percent: float = None) -> Dict[str, List[SensorReading]]:
         # 1. Check for real hardware sensors if available
         try:
             temps = psutil.sensors_temperatures() if hasattr(psutil, "sensors_temperatures") else {}
@@ -121,12 +118,15 @@ class HardwareCollector(BaseCollector):
 
         # 2. Physics-inspired dynamic thermal estimation based on live CPU/RAM usage
         import random
-        try:
-            cpu_usage = psutil.cpu_percent(interval=None) or 15.0
-            ram_percent = psutil.virtual_memory().percent or 40.0
-        except Exception:
-            cpu_usage = 15.0
-            ram_percent = 40.0
+        if cpu_usage is None or ram_percent is None:
+            try:
+                if cpu_usage is None:
+                    cpu_usage = psutil.cpu_percent(interval=None) or 15.0
+                if ram_percent is None:
+                    ram_percent = psutil.virtual_memory().percent or 40.0
+            except Exception:
+                cpu_usage = 15.0
+                ram_percent = 40.0
 
         target_cpu = 38.0 + (cpu_usage / 100.0) * 40.0
         target_ram = 34.0 + (ram_percent / 100.0) * 14.0
@@ -147,9 +147,9 @@ class HardwareCollector(BaseCollector):
             "disk": [SensorReading(label="System Storage", current=self._disk_temp, high=55.0, critical=70.0)]
         }
 
-    def collect(self) -> Dict[str, Any]:
+    def collect(self, cpu_usage: float = None, ram_percent: float = None) -> Dict[str, Any]:
         sensors = {}
-        sensors["temperatures"] = self._get_temperatures()
+        sensors["temperatures"] = self._get_temperatures(cpu_usage=cpu_usage, ram_percent=ram_percent)
                 
         if hasattr(psutil, "sensors_fans"):
             try:

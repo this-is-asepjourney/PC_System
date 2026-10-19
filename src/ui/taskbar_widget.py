@@ -272,9 +272,19 @@ class TaskbarWidget(QWidget):
         super().__init__()
         self.main_window = main_window
 
-        # Window Flags & Attributes
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint | Qt.Tool)
-        self.setAttribute(Qt.WA_TranslucentBackground)
+        # Window Flags & Attributes for persistent taskbar overlay
+        self.setWindowFlags(
+            Qt.WindowStaysOnTopHint |
+            Qt.FramelessWindowHint |
+            Qt.Tool |
+            Qt.WindowDoesNotAcceptFocus
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setAttribute(Qt.WA_AlwaysShowToolTips, True)
+
+        # Anti-Disappear & State Tracking
+        self._is_active_mode = False
 
         # Settings with sensible defaults
         self._settings = {
@@ -308,10 +318,16 @@ class TaskbarWidget(QWidget):
         self._top_cpu_proc = "-"
         self._top_mem_proc = "-"
 
-        # Keep on top timer (gentle 5s interval to save CPU)
+        # Keep on top heartbeat timer (1200ms for rock-solid taskbar persistence)
         self.top_timer = QTimer(self)
         self.top_timer.timeout.connect(self._ensure_on_top)
-        self.top_timer.start(5000)
+        self.top_timer.start(1200)
+
+        # Listen for screen resolution & taskbar geometry changes
+        primary_screen = QGuiApplication.primaryScreen()
+        if primary_screen:
+            primary_screen.geometryChanged.connect(self._on_screen_changed)
+            primary_screen.availableGeometryChanged.connect(self._on_screen_changed)
 
         # Build UI
         self._init_ui()
@@ -501,6 +517,9 @@ class TaskbarWidget(QWidget):
             self._disk_temp_val = float(curr)
             self._disk_temp_str = f"{self._disk_temp_val:.0f}°"
 
+        if not self.isVisible():
+            return
+
         # Battery update
         if self._settings["show_battery"]:
             battery_data = data.get("battery")
@@ -511,19 +530,25 @@ class TaskbarWidget(QWidget):
 
     def update_cpu(self, data: dict):
         self._cached_cpu_data = data
+        if not self.isVisible():
+            return
         usage = data.get('usage', 0.0)
         fg_col, bg_col = self._get_temp_color_and_bg(self._cpu_temp_val)
         self.item_cpu.set_data(f"{usage:.0f}%", self._cpu_temp_str, fg_col, bg_col)
+        # Periodically re-assert topmost without extra timers
+        self._force_topmost()
 
     def update_memory(self, data: dict):
         self._cached_mem_data = data
+        if not self.isVisible():
+            return
         pct = data.get('percent', 0.0)
         fg_col, bg_col = self._get_temp_color_and_bg(self._ram_temp_val)
         self.item_ram.set_data(f"{pct:.0f}%", self._ram_temp_str, fg_col, bg_col)
 
     def update_disk(self, data: dict):
         self._cached_disk_data = data
-        if not self._settings["show_disk"]:
+        if not self.isVisible() or not self._settings["show_disk"]:
             return
         partitions = data.get("partitions", [])
         pct = partitions[0]['percent'] if partitions else 0.0
@@ -532,7 +557,7 @@ class TaskbarWidget(QWidget):
 
     def update_network(self, data: dict):
         self._cached_net_data = data
-        if not self._settings["show_net"]:
+        if not self.isVisible() or not self._settings["show_net"]:
             return
         dl_bytes = data.get('download_speed', 0.0)
         ul_bytes = data.get('upload_speed', 0.0)
@@ -605,69 +630,150 @@ class TaskbarWidget(QWidget):
             event.accept()
 
     def _ensure_on_top(self):
-        if self.isVisible():
+        if self.isVisible() and self._is_active_mode:
+            self._force_topmost()
+
+    def _apply_win32_styles(self):
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOPMOST = 0x00000008
+            current = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, current | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
+        except Exception:
+            pass
+
+    def _force_topmost(self):
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            HWND_TOPMOST = -1
+            SWP_NOSIZE = 0x0001
+            SWP_NOMOVE = 0x0002
+            SWP_NOACTIVATE = 0x0010
+            SWP_SHOWWINDOW = 0x0040
+            user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        except Exception:
             self.raise_()
 
-    def restore_window_mode(self):
+    def show_mode(self):
+        """Explicit entry into taskbar mode."""
+        self._is_active_mode = True
+        self.showNormal()
+        self.show()
+        self._apply_win32_styles()
+        self._force_topmost()
+        QTimer.singleShot(20, self.position_in_taskbar)
+
+    def hide_mode(self):
+        """Explicit exit from taskbar mode."""
+        self._is_active_mode = False
         self.hide()
+
+    def restore_window_mode(self):
+        self.hide_mode()
         self.main_window.show()
         self.main_window.activateWindow()
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._apply_win32_styles()
+        self._force_topmost()
         self.adjustSize()
         QTimer.singleShot(20, self.position_in_taskbar)
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        # If involuntarily hidden by Windows (e.g. Win+D Show Desktop or taskbar click), immediately restore!
+        if self._is_active_mode:
+            QTimer.singleShot(40, self._restore_taskbar_visibility)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            if self.isMinimized() and self._is_active_mode:
+                self.showNormal()
+                self._force_topmost()
+
+    def _restore_taskbar_visibility(self):
+        if self._is_active_mode:
+            self.showNormal()
+            self.show()
+            self._apply_win32_styles()
+            self._force_topmost()
+
+    def _on_screen_changed(self, *args):
+        if self.isVisible() and self._is_active_mode:
+            self.position_in_taskbar()
 
     def position_in_taskbar(self, align: str = None):
         """
         Calculates exact coordinates and docks widget safely in taskbar
-        without overlapping pinned app icons.
+        with multi-monitor support and screen clamping.
         """
         if align:
             self._settings["dock_preset"] = align
             self._save_settings()
         else:
-            align = self._settings["dock_preset"]
+            align = self._settings.get("dock_preset", "right")
 
-        screen = self.screen()
+        screen = self.screen() or QGuiApplication.primaryScreen()
         if not screen:
-            screen = QGuiApplication.primaryScreen()
+            return
 
         geom = screen.geometry()
         avail = screen.availableGeometry()
 
-        taskbar_height = geom.height() - avail.height()
-        if taskbar_height <= 0:
-            taskbar_height = 48  # Default Windows 11 taskbar height
-
         self.adjustSize()
-        widget_w = max(self.sizeHint().width(), self.width())
+        widget_w = max(self.sizeHint().width(), self.width(), 200)
         widget_h = 36  # Ergonomic height for 2 rows in taskbar
         self.setFixedHeight(widget_h)
 
-        # Vertically centered in bottom taskbar
-        target_y = geom.height() - taskbar_height + (taskbar_height - widget_h) // 2
-        if target_y + widget_h > geom.height():
-            target_y = geom.height() - widget_h - 2
-        if target_y < 0:
-            target_y = 0
-
-        # Target X based on alignment
-        if align == "right":
-            # Safely docked to the right, just to the left of Windows 11 system tray
-            target_x = avail.right() - widget_w - 180
-        elif align == "center":
-            target_x = (geom.width() - widget_w) // 2
-        elif align == "left":
-            target_x = 120
-        elif align == "custom" and self._settings["saved_x"] is not None:
-            target_x = self._settings["saved_x"]
-            target_y = self._settings["saved_y"]
+        # Detect taskbar position (Bottom, Top, Left, Right, or Auto-hide)
+        if avail.top() > geom.top():
+            # Top taskbar
+            tb_height = avail.top() - geom.top()
+            target_y = geom.top() + (tb_height - widget_h) // 2
+        elif avail.bottom() < geom.bottom():
+            # Bottom taskbar (default Windows 10/11)
+            tb_height = geom.bottom() - avail.bottom()
+            target_y = avail.bottom() + (tb_height - widget_h) // 2
         else:
-            target_x = avail.right() - widget_w - 180
+            # Auto-hidden taskbar or fullscreen
+            tb_height = 48
+            target_y = geom.bottom() - widget_h - 4
 
-        target_x = max(10, min(geom.width() - widget_w - 10, target_x))
+        # Target X based on alignment preset
+        if align == "right":
+            # Safely docked to the right with 230px buffer to prevent overlapping Windows 11 system tray
+            target_x = avail.right() - widget_w - 230
+        elif align == "center":
+            target_x = geom.left() + (geom.width() - widget_w) // 2
+        elif align == "left":
+            target_x = geom.left() + 140
+        elif align == "custom" and self._settings.get("saved_x") is not None:
+            target_x = self._settings["saved_x"]
+            target_y = self._settings.get("saved_y", target_y)
+        else:
+            target_x = avail.right() - widget_w - 230
+
+        # Strict screen clamping to guarantee it is NEVER placed offscreen
+        min_x = geom.left() + 5
+        max_x = geom.right() - widget_w - 5
+        min_y = geom.top()
+        max_y = geom.bottom() - widget_h
+
+        target_x = max(min_x, min(max_x, target_x))
+        target_y = max(min_y, min(max_y, target_y))
+
         self.move(target_x, target_y)
+        self._force_topmost()
 
     def _show_context_menu(self, pos: QPoint):
         menu = QMenu(self)
@@ -730,6 +836,11 @@ class TaskbarWidget(QWidget):
         dock_menu = menu.addMenu("📍  Dock ke Taskbar")
         dock_menu.setStyleSheet(menu.styleSheet())
 
+        act_dock_reset = dock_menu.addAction("🔄  Reset ke Posisi Standar (Kanan)")
+        act_dock_reset.triggered.connect(lambda: self.position_in_taskbar("right"))
+
+        dock_menu.addSeparator()
+
         act_dock_r = dock_menu.addAction("Kanan (Dekat System Tray)")
         act_dock_r.triggered.connect(lambda: self.position_in_taskbar("right"))
 
@@ -791,7 +902,7 @@ class TaskbarWidget(QWidget):
         self._save_settings()
 
     def _switch_to_mini(self):
-        self.hide()
+        self.hide_mode()
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.show()
             self.main_window.mini_widget.activateWindow()

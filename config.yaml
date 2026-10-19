@@ -9,9 +9,9 @@ monitoring:
     memory: 1.0
     disk: 2.0
     network: 1.0
-    process: 2.0
+    process: 5.0
     hardware: 3.0
-    database: 5.0
+    database: 30.0
 
 alerts:
   thresholds:

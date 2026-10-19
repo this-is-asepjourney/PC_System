@@ -189,7 +189,13 @@ class MiniWidget(QWidget):
 
     def _ensure_on_top(self):
         if self.isVisible():
-            self.raise_()
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                hwnd = int(self.winId())
+                user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040)
+            except Exception:
+                self.raise_()
 
     def _get_temp_color(self, temp: float) -> str:
         if temp < 55.0:
@@ -200,6 +206,8 @@ class MiniWidget(QWidget):
             return "#f38ba8"
 
     def update_hardware(self, data: dict):
+        if not self.isVisible():
+            return
         temps = data.get("temperatures", {})
         if "cpu" in temps and temps["cpu"]:
             curr = getattr(temps["cpu"][0], "current", temps["cpu"][0].get("current") if isinstance(temps["cpu"][0], dict) else 40.0)
@@ -217,22 +225,30 @@ class MiniWidget(QWidget):
             self._disk_temp_str = f"{self._disk_temp_val:.0f}°C"
 
     def update_cpu(self, data: dict):
+        if not self.isVisible():
+            return
         usage = data['usage']
         color = self._get_temp_color(self._cpu_temp_val)
         self.row_cpu.set_data(f"{usage:.1f}%", f"🌡️ {self._cpu_temp_str}", color)
         
     def update_memory(self, data: dict):
+        if not self.isVisible():
+            return
         pct = data['percent']
         color = self._get_temp_color(self._ram_temp_val)
         self.row_ram.set_data(f"{pct:.1f}%", f"🌡️ {self._ram_temp_str}", color)
         
     def update_disk(self, data: dict):
+        if not self.isVisible():
+            return
         partitions = data.get("partitions", [])
         pct = partitions[0]['percent'] if partitions else 0.0
         color = self._get_temp_color(self._disk_temp_val)
         self.row_disk.set_data(f"{pct:.1f}%", f"🌡️ {self._disk_temp_str}", color)
 
     def update_network(self, data: dict):
+        if not self.isVisible():
+            return
         dl_b = data.get('download_speed', 0.0)
         ul_b = data.get('upload_speed', 0.0)
         dl_str = self._format_speed(dl_b)

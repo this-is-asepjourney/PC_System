@@ -51,14 +51,14 @@ class SystemTray(QSystemTrayIcon):
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.hide()
         if hasattr(self.main_window, "taskbar_widget"):
-            self.main_window.taskbar_widget.hide()
+            self.main_window.taskbar_widget.hide_mode()
         self.main_window.show()
         self.main_window.activateWindow()
         
     def show_mini(self):
         self.main_window.hide()
         if hasattr(self.main_window, "taskbar_widget"):
-            self.main_window.taskbar_widget.hide()
+            self.main_window.taskbar_widget.hide_mode()
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.show()
             self.main_window.mini_widget.activateWindow()
@@ -68,8 +68,7 @@ class SystemTray(QSystemTrayIcon):
         if hasattr(self.main_window, "mini_widget"):
             self.main_window.mini_widget.hide()
         if hasattr(self.main_window, "taskbar_widget"):
-            self.main_window.taskbar_widget.show()
-            self.main_window.taskbar_widget.activateWindow()
+            self.main_window.taskbar_widget.show_mode()
         
     def quit_app(self):
         self.app.quit()

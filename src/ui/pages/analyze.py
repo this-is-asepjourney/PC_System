@@ -153,9 +153,12 @@ class AnalyzePage(QWidget):
         
         layout.addLayout(results_layout)
         layout.setStretchFactor(results_layout, 1)
-        
-        # Initial Run
-        QTimer.singleShot(500, self._run_analysis)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not hasattr(self, "_has_analyzed"):
+            self._has_analyzed = True
+            QTimer.singleShot(100, self._run_analysis)
         
     def _run_analysis(self):
         self.btn_analyze.setEnabled(False)

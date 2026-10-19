@@ -11,8 +11,8 @@ class AnalyzeService:
         bottlenecks = []
         recommendations = []
         
-        # CPU
-        cpu_usage = psutil.cpu_percent(interval=1.0)
+        # CPU (non-blocking delta calculation)
+        cpu_usage = psutil.cpu_percent(interval=None) or 15.0
         if cpu_usage > 90:
             score -= 25
             bottlenecks.append(f"Critical CPU Usage ({cpu_usage}%)")

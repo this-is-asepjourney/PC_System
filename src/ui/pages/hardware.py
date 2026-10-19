@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame, QGridLayout, QProgressBar
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QScrollArea, QFrame, QGridLayout, QProgressBar, QPushButton
 )
 from PySide6.QtCore import Qt, Signal, QObject
 from src.core.events import event_bus
@@ -96,11 +96,35 @@ class HardwarePage(QWidget):
         self.devices_layout = QVBoxLayout(self.devices_card)
         self.devices_layout.setSpacing(8)
         
+        # Header row for devices with manual refresh
+        dev_header = QHBoxLayout()
         dev_title = QLabel("🔌 Connected Devices & Peripherals")
         dev_title.setStyleSheet("font-size: 16px; font-weight: 700; color: #cba6f7; border: none;")
-        self.devices_layout.addWidget(dev_title)
+        dev_header.addWidget(dev_title)
+        dev_header.addStretch()
+
+        self.btn_scan_devices = QPushButton("🔄 Scan Peripherals")
+        self.btn_scan_devices.setCursor(Qt.PointingHandCursor)
+        self.btn_scan_devices.setStyleSheet("""
+            QPushButton {
+                background-color: #313244;
+                color: #cba6f7;
+                border: 1px solid #45475a;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #cba6f7;
+                color: #11111b;
+            }
+        """)
+        self.btn_scan_devices.clicked.connect(self._manual_device_scan)
+        dev_header.addWidget(self.btn_scan_devices)
+        self.devices_layout.addLayout(dev_header)
         
-        self.devices_info = QLabel("Scanning for peripherals...")
+        self.devices_info = QLabel("Klik 'Scan Peripherals' untuk memindai perangkat bluetooth & USB tanpa membebani CPU saat startup.")
         self.devices_info.setStyleSheet("color: #a6adc8; font-size: 13px; border: none;")
         self.devices_info.setWordWrap(True)
         self.devices_layout.addWidget(self.devices_info)
@@ -111,7 +135,16 @@ class HardwarePage(QWidget):
         self.bridge.hardware_updated.connect(self.update_hardware)
         event_bus.subscribe("metrics_hardware", self.bridge.hardware_updated.emit)
         
+    def _manual_device_scan(self):
+        from PySide6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if hasattr(app, "monitoring_service"):
+            app.monitoring_service.hardware_collector.trigger_background_device_scan(force=True)
+            self.devices_info.setText("Scanning Bluetooth and connected peripherals in background...")
+
     def update_hardware(self, data: dict):
+        if not self.isVisible():
+            return
         # 1. Update Temperatures
         # Clear grid
         while self.temp_grid.count():

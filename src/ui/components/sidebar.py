@@ -80,7 +80,7 @@ class Sidebar(QFrame):
         win = self.window()
         win.hide()
         if hasattr(win, "taskbar_widget"):
-            win.taskbar_widget.hide()
+            win.taskbar_widget.hide_mode()
         if hasattr(win, "mini_widget"):
             win.mini_widget.show()
             win.mini_widget.activateWindow()
@@ -91,8 +91,7 @@ class Sidebar(QFrame):
         if hasattr(win, "mini_widget"):
             win.mini_widget.hide()
         if hasattr(win, "taskbar_widget"):
-            win.taskbar_widget.show()
-            win.taskbar_widget.activateWindow()
+            win.taskbar_widget.show_mode()
 
     def set_active(self, page_id: str):
         for pid, btn in self.buttons.items():

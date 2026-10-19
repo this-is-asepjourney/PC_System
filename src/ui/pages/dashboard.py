@@ -206,14 +206,13 @@ class DashboardPage(QWidget):
         if hasattr(window, 'mini_widget'):
             window.mini_widget.hide()
         if hasattr(window, 'taskbar_widget'):
-            window.taskbar_widget.show()
-            window.taskbar_widget.activateWindow()
+            window.taskbar_widget.show_mode()
 
     def open_mini_mode(self):
         window = self.window()
         window.hide()
         if hasattr(window, 'taskbar_widget'):
-            window.taskbar_widget.hide()
+            window.taskbar_widget.hide_mode()
         if hasattr(window, 'mini_widget'):
             window.mini_widget.show()
             window.mini_widget.activateWindow()

@@ -64,11 +64,30 @@ class DatabaseConnection:
 
     @contextmanager
     def get_connection(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row # To access columns by name
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row  # To access columns by name
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
         try:
             yield conn
         finally:
             conn.close()
+
+    def clean_old_records(self, retention_days: int = 7):
+        """Purges metric and log entries older than retention_days to minimize disk usage."""
+        try:
+            with self.get_connection() as conn:
+                conn.execute(
+                    "DELETE FROM metrics WHERE timestamp < datetime('now', ?)",
+                    (f"-{retention_days} days",)
+                )
+                conn.execute(
+                    "DELETE FROM system_logs WHERE timestamp < datetime('now', ?)",
+                    (f"-{retention_days} days",)
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to clean old database records: {e}")
 
 db = DatabaseConnection()

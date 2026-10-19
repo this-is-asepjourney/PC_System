@@ -53,6 +53,8 @@ class AlertsPage(QWidget):
         item.setForeground(Qt.black)
         item.setBackground(Qt.red if alert.severity == "Critical" else Qt.yellow)
         self.alert_list.insertItem(0, item)
+        if self.alert_list.count() > 50:
+            self.alert_list.takeItem(self.alert_list.count() - 1)
         
     def on_alert_resolved(self, alert):
         item = QListWidgetItem()
@@ -60,3 +62,5 @@ class AlertsPage(QWidget):
         item.setText(f"[{ts}] ✅ RESOLVED: {alert.message}")
         item.setForeground(Qt.green)
         self.alert_list.insertItem(0, item)
+        if self.alert_list.count() > 50:
+            self.alert_list.takeItem(self.alert_list.count() - 1)

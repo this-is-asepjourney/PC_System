@@ -32,8 +32,7 @@ def main(app: QApplication):
     app.window.tray.show()
     
     if "--taskbar" in sys.argv:
-        app.taskbar_widget.show()
-        app.taskbar_widget.activateWindow()
+        app.taskbar_widget.show_mode()
     elif "--mini" in sys.argv:
         app.mini_widget.show()
         app.mini_widget.activateWindow()
