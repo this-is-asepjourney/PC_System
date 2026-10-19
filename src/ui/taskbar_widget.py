@@ -644,6 +644,15 @@ class TaskbarWidget(QWidget):
             WS_EX_TOPMOST = 0x00000008
             current = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             user32.SetWindowLongW(hwnd, GWL_EXSTYLE, current | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
+
+            # Win32 Window Ownership:
+            # Set Shell_TrayWnd (Windows Taskbar) as the OWNER window (GWLP_HWNDPARENT).
+            # Microsoft Win32 Rule: "An owned window is always displayed ABOVE its owner window in the z-order."
+            # This completely stops Windows from covering this widget when the user clicks anywhere on the taskbar!
+            tray_hwnd = user32.FindWindowW("Shell_TrayWnd", None)
+            if tray_hwnd:
+                GWLP_HWNDPARENT = -8
+                user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, tray_hwnd)
         except Exception:
             pass
 
@@ -674,6 +683,14 @@ class TaskbarWidget(QWidget):
     def hide_mode(self):
         """Explicit exit from taskbar mode."""
         self._is_active_mode = False
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            hwnd = int(self.winId())
+            GWLP_HWNDPARENT = -8
+            user32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0)
+        except Exception:
+            pass
         self.hide()
 
     def restore_window_mode(self):
@@ -715,7 +732,7 @@ class TaskbarWidget(QWidget):
     def position_in_taskbar(self, align: str = None):
         """
         Calculates exact coordinates and docks widget safely in taskbar
-        with multi-monitor support and screen clamping.
+        with dynamic Windows 11 system tray detection, multi-monitor support, and screen clamping.
         """
         if align:
             self._settings["dock_preset"] = align
@@ -735,8 +752,33 @@ class TaskbarWidget(QWidget):
         widget_h = 36  # Ergonomic height for 2 rows in taskbar
         self.setFixedHeight(widget_h)
 
-        # Detect taskbar position (Bottom, Top, Left, Right, or Auto-hide)
-        if avail.top() > geom.top():
+        # Detect native Windows Taskbar and System Tray bounds dynamically
+        tray_notify_left = None
+        native_taskbar_y = None
+        native_taskbar_h = None
+        try:
+            import ctypes, ctypes.wintypes
+            user32 = ctypes.windll.user32
+            tray_hwnd = user32.FindWindowW("Shell_TrayWnd", None)
+            if tray_hwnd:
+                t_rect = ctypes.wintypes.RECT()
+                if user32.GetWindowRect(tray_hwnd, ctypes.byref(t_rect)):
+                    native_taskbar_y = t_rect.top
+                    native_taskbar_h = t_rect.bottom - t_rect.top
+
+                notify_hwnd = user32.FindWindowExW(tray_hwnd, None, "TrayNotifyWnd", None)
+                if notify_hwnd:
+                    n_rect = ctypes.wintypes.RECT()
+                    if user32.GetWindowRect(notify_hwnd, ctypes.byref(n_rect)):
+                        if n_rect.left > 0:
+                            tray_notify_left = n_rect.left
+        except Exception:
+            pass
+
+        # Target Y calculation: vertically center inside taskbar
+        if native_taskbar_y is not None and native_taskbar_h is not None and native_taskbar_h > 0:
+            target_y = native_taskbar_y + (native_taskbar_h - widget_h) // 2
+        elif avail.top() > geom.top():
             # Top taskbar
             tb_height = avail.top() - geom.top()
             target_y = geom.top() + (tb_height - widget_h) // 2
@@ -746,13 +788,15 @@ class TaskbarWidget(QWidget):
             target_y = avail.bottom() + (tb_height - widget_h) // 2
         else:
             # Auto-hidden taskbar or fullscreen
-            tb_height = 48
             target_y = geom.bottom() - widget_h - 4
 
         # Target X based on alignment preset
         if align == "right":
-            # Safely docked to the right with 230px buffer to prevent overlapping Windows 11 system tray
-            target_x = avail.right() - widget_w - 230
+            if tray_notify_left and tray_notify_left > (geom.left() + widget_w + 50):
+                # Pixel-perfect alignment right to the left of the Windows 11 system tray cluster
+                target_x = tray_notify_left - widget_w - 12
+            else:
+                target_x = avail.right() - widget_w - 230
         elif align == "center":
             target_x = geom.left() + (geom.width() - widget_w) // 2
         elif align == "left":
@@ -773,6 +817,7 @@ class TaskbarWidget(QWidget):
         target_y = max(min_y, min(max_y, target_y))
 
         self.move(target_x, target_y)
+        self._apply_win32_styles()
         self._force_topmost()
 
     def _show_context_menu(self, pos: QPoint):
