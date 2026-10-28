@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import sys
 from contextlib import contextmanager
 from src.core.config import config
 from src.core.logger import logger
@@ -15,6 +16,12 @@ class DatabaseConnection:
         
     def _init_db(self):
         self.db_path = config.get('database.path', 'data/pc_system.db')
+        if not os.path.isabs(self.db_path):
+            if getattr(sys, 'frozen', False):
+                base_dir = os.path.dirname(os.path.abspath(sys.executable))
+            else:
+                base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            self.db_path = os.path.join(base_dir, self.db_path)
         
         # Ensure directory exists
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)

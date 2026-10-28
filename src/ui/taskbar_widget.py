@@ -1,28 +1,227 @@
 import os
+import sys
 import json
+import math
+import html
+import time
 import subprocess
+from collections import deque
 from PySide6.QtWidgets import (
-    QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QMenu,
-    QGraphicsDropShadowEffect, QFrame, QApplication
+    QWidget, QHBoxLayout, QVBoxLayout, QPushButton, QMenu, QApplication
 )
-from PySide6.QtCore import Qt, QPoint, QTimer, Signal, QObject, QEvent
-from PySide6.QtGui import QColor, QPainter, QCursor, QAction, QFont, QGuiApplication
+from PySide6.QtCore import (
+    Qt, QPoint, QPointF, QRectF, QTimer, Signal, QObject, QEvent,
+    QElapsedTimer, QPropertyAnimation, QEasingCurve
+)
+from PySide6.QtGui import (
+    QColor, QPainter, QPainterPath, QLinearGradient, QPen, QFont, QGuiApplication
+)
 from src.core.events import event_bus
 
-CONFIG_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "taskbar_config.json")
+if getattr(sys, 'frozen', False):
+    _APP_ROOT = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CONFIG_FILE_PATH = os.path.join(_APP_ROOT, "data", "taskbar_config.json")
 
-class TaskbarBridge(QObject):
-    cpu_updated = Signal(dict)
-    memory_updated = Signal(dict)
-    disk_updated = Signal(dict)
-    network_updated = Signal(dict)
-    hardware_updated = Signal(dict)
-    process_updated = Signal(dict)
 
+# ---------------------------------------------------------------------------
+# Palette (Catppuccin Mocha inspired) & helpers
+# ---------------------------------------------------------------------------
+C_WHITE = "#ffffff"
+C_TEXT = "#cdd6f4"
+C_SUBTEXT = "#a6adc8"
+C_OVERLAY = "#7f849c"
+C_GREEN = "#a6e3a1"
+C_YELLOW = "#f9e2af"
+C_RED = "#f38ba8"
+C_PEACH = "#fab387"
+C_SKY = "#74c7ec"
+C_BLUE = "#89b4fa"
+C_NET_DL = "#38bdf8"
+C_NET_UL = "#c084fc"
+
+TOOLTIP_QSS = """
+QToolTip {
+    background-color: #181825;
+    color: #cdd6f4;
+    border: 1px solid #313244;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-family: 'Segoe UI';
+    font-size: 11px;
+}
+"""
+
+
+def _qc(hex_or_color, alpha: int = None) -> QColor:
+    c = QColor(hex_or_color)
+    if alpha is not None:
+        c.setAlpha(max(0, min(255, int(alpha))))
+    return c
+
+
+def _mix(c1: QColor, c2: QColor, t: float) -> QColor:
+    t = max(0.0, min(1.0, t))
+    return QColor(
+        int(c1.red() + (c2.red() - c1.red()) * t),
+        int(c1.green() + (c2.green() - c1.green()) * t),
+        int(c1.blue() + (c2.blue() - c1.blue()) * t),
+        int(c1.alpha() + (c2.alpha() - c1.alpha()) * t),
+    )
+
+
+def _status_color(value: float, warn: float, crit: float, base: QColor) -> QColor:
+    """Smoothly blends accent -> yellow -> red as the load approaches thresholds."""
+    yellow, red = QColor(C_YELLOW), QColor(C_RED)
+    if value < warn - 10:
+        return QColor(base)
+    if value < warn:
+        return _mix(base, yellow, (value - (warn - 10)) / 10.0)
+    if value < crit - 5:
+        return yellow
+    if value < crit:
+        return _mix(yellow, red, (value - (crit - 5)) / 5.0)
+    return red
+
+
+def _temp_color(t: float) -> QColor:
+    green, yellow, red = QColor(C_GREEN), QColor(C_YELLOW), QColor(C_RED)
+    if t < 50:
+        return green
+    if t < 60:
+        return _mix(green, yellow, (t - 50) / 10.0)
+    if t < 75:
+        return yellow
+    if t < 85:
+        return _mix(yellow, red, (t - 75) / 10.0)
+    return red
+
+
+def _format_speed(b_s: float) -> str:
+    if b_s < 1024:
+        return f"{b_s:.0f} B/s"
+    elif b_s < 1024 * 1024:
+        return f"{b_s / 1024:.0f} KB/s"
+    elif b_s < 1024 * 1024 * 1024:
+        return f"{b_s / (1024 * 1024):.1f} MB/s"
+    else:
+        return f"{b_s / (1024 * 1024 * 1024):.2f} GB/s"
+
+
+def _format_bytes(b: float) -> str:
+    if b < 1024 ** 2:
+        return f"{b / 1024:.0f} KB"
+    if b < 1024 ** 3:
+        return f"{b / 1024 ** 2:.0f} MB"
+    if b < 1024 ** 4:
+        return f"{b / 1024 ** 3:.1f} GB"
+    return f"{b / 1024 ** 4:.2f} TB"
+
+
+def _make_font(px: int, weight: QFont.Weight) -> QFont:
+    f = QFont()
+    f.setFamilies(["Segoe UI Variable Small", "Segoe UI", "Arial"])
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    return f
+
+
+# ---------------------------------------------------------------------------
+# On-demand animation clock
+# ---------------------------------------------------------------------------
+class AnimationClock(QObject):
+    """
+    Single shared timer that drives every animated cell.
+    - Runs at ~25 FPS only while a value is tweening (~0.4s after each data update).
+    - Drops to ~11 FPS when only slow 'breathing' pulses are active (critical states).
+    - Fully stops when everything is settled -> zero idle CPU wakeups.
+    """
+    FAST_MS = 40
+    SLOW_MS = 90
+
+    MODE_IDLE = 0
+    MODE_SLOW = 1
+    MODE_FAST = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.enabled = True
+        self._clients = []
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.CoarseTimer)
+        self._timer.timeout.connect(self._tick)
+        self._elapsed = QElapsedTimer()
+
+    def register(self, client):
+        self._clients.append(client)
+
+    def wake(self):
+        if not self.enabled:
+            return
+        if not self._timer.isActive():
+            self._elapsed.start()
+            self._timer.start(self.FAST_MS)
+        elif self._timer.interval() != self.FAST_MS:
+            self._timer.setInterval(self.FAST_MS)
+
+    def stop(self):
+        self._timer.stop()
+
+    def set_enabled(self, enabled: bool):
+        self.enabled = enabled
+        if not enabled:
+            self._timer.stop()
+            for c in self._clients:
+                c.advance(0.0, False)  # snap everything to final state
+        else:
+            self.wake()
+
+    def _tick(self):
+        dt = min(self._elapsed.restart() / 1000.0, 0.2)
+        mode = self.MODE_IDLE
+        for c in self._clients:
+            if c.isVisible():
+                mode = max(mode, c.advance(dt, True))
+
+        if mode == self.MODE_IDLE:
+            self._timer.stop()
+        elif mode == self.MODE_SLOW and self._timer.interval() != self.SLOW_MS:
+            self._timer.setInterval(self.SLOW_MS)
+        elif mode == self.MODE_FAST and self._timer.interval() != self.FAST_MS:
+            self._timer.setInterval(self.FAST_MS)
+
+
+class AnimatedCell(QWidget):
+    """Base for custom-painted cells driven by the AnimationClock."""
+    def __init__(self, clock: AnimationClock, parent=None):
+        super().__init__(parent)
+        self._clock = clock
+        clock.register(self)
+
+    def _kick(self):
+        self._clock.wake()
+
+    def advance(self, dt: float, animate: bool) -> int:
+        return AnimationClock.MODE_IDLE
+
+
+def _ease_towards(current: float, target: float, dt: float, speed: float, snap: float) -> tuple[float, bool]:
+    """Exponential smoothing. Returns (new_value, still_moving)."""
+    diff = target - current
+    if abs(diff) <= snap:
+        return target, False
+    return current + diff * (1.0 - math.exp(-dt * speed)), True
+
+
+# ---------------------------------------------------------------------------
+# Visual building blocks
+# ---------------------------------------------------------------------------
 class DragGrip(QWidget):
     """
     Ultra-compact vertical drag grip handle.
     Width: 6px. Fits seamlessly without consuming horizontal space.
+    The pill is tinted with the overall system health colour (green / yellow / red).
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -30,6 +229,7 @@ class DragGrip(QWidget):
         self.setFixedHeight(22)
         self._hovered = False
         self._locked = False
+        self._status = QColor(C_GREEN)
         self.setCursor(Qt.SizeAllCursor)
         self.setToolTip("Tahan & Geser untuk memindahkan\nKlik kanan untuk Opsi")
 
@@ -37,6 +237,11 @@ class DragGrip(QWidget):
         self._locked = locked
         self.setCursor(Qt.ArrowCursor if locked else Qt.SizeAllCursor)
         self.update()
+
+    def set_status_color(self, color: QColor):
+        if color.rgb() != self._status.rgb():
+            self._status = QColor(color)
+            self.update()
 
     def enterEvent(self, event):
         self._hovered = True
@@ -53,220 +258,593 @@ class DragGrip(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         if self._locked:
-            color = QColor(108, 112, 134, 80)
+            color = QColor(108, 112, 134, 90)
         elif self._hovered:
-            color = QColor(137, 180, 250, 220)
+            color = _qc(C_BLUE, 230)
         else:
-            color = QColor(255, 255, 255, 50)
+            color = _qc(self._status, 170)
 
         painter.setBrush(color)
         painter.setPen(Qt.NoPen)
         # Single rounded slim pill handle
-        painter.drawRoundedRect(1, 2, 3, 18, 1.5, 1.5)
+        painter.drawRoundedRect(QRectF(1.5, 3, 3, 16), 1.5, 1.5)
 
-class DualRowItem(QWidget):
-    """
-    Single compact line within the 2-row layout.
-    Displays tag badge, tabular numeric value, and temperature badge.
-    Height: 15px.
-    """
-    def __init__(self, tag: str, tag_color: str, parent=None):
+
+class Divider(QWidget):
+    """1px vertical divider that fades out at both ends."""
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.tag = tag
-        self.tag_color = tag_color
-        self._show_sub = True
-        self.setFixedHeight(15)
+        self.setFixedWidth(1)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(3)
+    def paintEvent(self, event):
+        p = QPainter(self)
+        h = self.height()
+        g = QLinearGradient(0, 3, 0, h - 3)
+        g.setColorAt(0.0, QColor(255, 255, 255, 0))
+        g.setColorAt(0.5, QColor(255, 255, 255, 34))
+        g.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.fillRect(QRectF(0, 3, 1, h - 6), g)
 
-        # Tag Badge
-        self.lbl_tag = QLabel(tag)
-        c = QColor(tag_color)
-        self.lbl_tag.setStyleSheet(f"""
-            QLabel {{
-                color: {tag_color};
-                font-family: 'Segoe UI', Arial, sans-serif;
-                font-size: 8.5px;
-                font-weight: 800;
-                background-color: rgba({c.red()}, {c.green()}, {c.blue()}, 0.16);
-                border-radius: 2px;
-                padding: 0px 3px;
-                min-width: 18px;
-            }}
-        """)
-        layout.addWidget(self.lbl_tag)
 
-        # Primary Value (e.g. 41%)
-        self.lbl_val = QLabel("--%")
-        self.lbl_val.setStyleSheet("""
-            QLabel {{
-                color: #ffffff;
-                font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace;
-                font-size: 9.5px;
-                font-weight: 700;
-            }}
-        """)
-        layout.addWidget(self.lbl_val)
+class GlassContainer(AnimatedCell):
+    """
+    Painted rounded 'glass' background. Replaces the stylesheet + QGraphicsDropShadowEffect
+    combo (the drop shadow forced an offscreen re-render of the whole widget on every repaint).
+    Animated: hover border glow and a slow red 'breathing' border during sustained critical load.
+    """
+    RADIUS = 7.0
 
-        # Sub / Temperature Badge (e.g. 66°C)
-        self.lbl_sub = QLabel("")
-        self.lbl_sub.setStyleSheet("""
-            QLabel {{
-                color: #a6e3a1;
-                font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace;
-                font-size: 8.5px;
-                font-weight: 600;
-                background-color: rgba(166, 227, 161, 0.12);
-                border-radius: 2px;
-                padding: 0px 2px;
-            }}
-        """)
-        layout.addWidget(self.lbl_sub)
+    def __init__(self, clock: AnimationClock, parent=None):
+        super().__init__(clock, parent)
+        self._opacity = 0.92
+        self._hover = 0.0
+        self._hover_target = 0.0
+        self._alert = False
+        self._phase = 0.0
 
-    def set_data(self, val_str: str, sub_str: str = "", sub_color: str = None, sub_bg: str = None):
-        if self.lbl_val.text() != val_str:
-            self.lbl_val.setText(val_str)
+    def set_opacity(self, opacity: float):
+        self._opacity = opacity
+        self.update()
 
-        if sub_str and self._show_sub:
-            if self.lbl_sub.text() != sub_str:
-                self.lbl_sub.setText(sub_str)
-                if sub_color:
-                    bg = sub_bg or "rgba(255, 255, 255, 0.08)"
-                    self.lbl_sub.setStyleSheet(f"""
-                        QLabel {{
-                            color: {sub_color};
-                            font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace;
-                            font-size: 8.5px;
-                            font-weight: 600;
-                            background-color: {bg};
-                            border-radius: 2px;
-                            padding: 0px 2px;
-                        }}
-                    """)
-            if not self.lbl_sub.isVisible():
-                self.lbl_sub.show()
+    def set_alert(self, alert: bool):
+        if alert != self._alert:
+            self._alert = alert
+            self._phase = 0.0
+            self.update()
+            self._kick()
+
+    def enterEvent(self, event):
+        self._hover_target = 1.0
+        if self._clock.enabled:
+            self._kick()
         else:
-            if self.lbl_sub.isVisible():
-                self.lbl_sub.hide()
+            self._hover = 1.0
+            self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_target = 0.0
+        if self._clock.enabled:
+            self._kick()
+        else:
+            self._hover = 0.0
+            self.update()
+        super().leaveEvent(event)
+
+    def advance(self, dt, animate):
+        if not animate:
+            self._hover = self._hover_target
+            self._phase = 0.0
+            self.update()
+            return AnimationClock.MODE_IDLE
+
+        mode = AnimationClock.MODE_IDLE
+        self._hover, moving = _ease_towards(self._hover, self._hover_target, dt, 12.0, 0.01)
+        if moving:
+            mode = AnimationClock.MODE_FAST
+        if self._alert:
+            self._phase = (self._phase + dt) % 2.4
+            mode = max(mode, AnimationClock.MODE_SLOW)
+        if mode or moving:
+            self.update()
+        return mode
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        a = int(self._opacity * 255)
+
+        # Body gradient
+        g = QLinearGradient(0, 0, 0, r.height())
+        g.setColorAt(0.0, QColor(32, 32, 48, a))
+        g.setColorAt(1.0, QColor(16, 16, 25, a))
+        p.setPen(Qt.NoPen)
+        p.setBrush(g)
+        p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
+
+        # Top inner highlight (glass edge)
+        hl = QLinearGradient(r.left(), 0, r.right(), 0)
+        hl.setColorAt(0.0, QColor(255, 255, 255, 0))
+        hl.setColorAt(0.5, QColor(255, 255, 255, 38))
+        hl.setColorAt(1.0, QColor(255, 255, 255, 0))
+        p.setPen(QPen(hl, 1.0))
+        p.drawLine(QPointF(r.left() + 6, r.top() + 1), QPointF(r.right() - 6, r.top() + 1))
+
+        # Border: neutral -> accent on hover -> red breathing on sustained alert
+        border = _mix(QColor(255, 255, 255, 24), _qc(C_BLUE, 120), self._hover)
+        if self._alert:
+            pulse = 0.5 + 0.5 * math.sin(self._phase / 2.4 * 2 * math.pi)
+            border = _mix(border, _qc(C_RED, 200), 0.35 + 0.45 * pulse)
+        p.setPen(QPen(border, 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(r, self.RADIUS, self.RADIUS)
+
+
+class MetricRow(AnimatedCell):
+    """
+    Single 15px line: [TAG] [animated value %] [temp badge]
+    Background: scrolling mini sparkline of the last ~30 samples.
+    Bottom: 2px load bar coloured by status (accent -> yellow -> red).
+    Optional activity LED on the tag (used for disk I/O).
+    """
+    H = 15
+    TAG_W = 22
+    PAD = 3
+    VAL_W = 28
+    SUB_W = 21
+    HISTORY = 30
+
+    def __init__(self, clock, tag: str, accent: str, warn: float, crit: float, parent=None):
+        super().__init__(clock, parent)
+        self.tag = tag
+        self.accent = QColor(accent)
+        self.warn = warn
+        self.crit = crit
+
+        self.history = deque(maxlen=self.HISTORY)
+        self.target = 0.0
+        self._display = 0.0
+        self._scroll = 0.0
+        self._phase = 0.0
+        self.has_data = False
+
+        self._sub_text = ""
+        self._sub_color = QColor(C_GREEN)
+        self._show_sub = True
+
+        self._has_led = False
+        self._led = 0.0
+        self._led_target = 0.0
+
+        self._f_tag = _make_font(8, QFont.Weight.ExtraBold)
+        self._f_val = _make_font(10, QFont.Weight.Bold)
+        self._f_sub = _make_font(8, QFont.Weight.DemiBold)
+
+        self.setFixedHeight(self.H)
+        self._update_width()
+
+    def _update_width(self):
+        w = self.TAG_W + self.PAD + self.VAL_W
+        if self._show_sub:
+            w += self.PAD + self.SUB_W
+        self.setFixedWidth(w)
 
     def set_show_sub(self, show: bool):
-        self._show_sub = show
-        if not show:
-            self.lbl_sub.hide()
-        elif self.lbl_sub.text():
-            self.lbl_sub.show()
+        if show != self._show_sub:
+            self._show_sub = show
+            self._update_width()
+            self.update()
 
-class DualRowNet(QWidget):
-    """
-    Stacked 2-row network bandwidth indicator.
-    Row 1: ↓ Download speed
-    Row 2: ↑ Upload speed
-    Total height: 32px.
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(32)
+    def enable_activity_led(self):
+        self._has_led = True
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(1)
-
-        # Row 1: Download
-        row_dl = QHBoxLayout()
-        row_dl.setContentsMargins(0, 0, 0, 0)
-        row_dl.setSpacing(2)
-
-        self.lbl_dl_icon = QLabel("↓")
-        self.lbl_dl_icon.setStyleSheet("color: #38bdf8; font-size: 9px; font-weight: 900;")
-        self.lbl_dl_val = QLabel("0 KB/s")
-        self.lbl_dl_val.setStyleSheet("color: #ffffff; font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace; font-size: 9px; font-weight: 700;")
-        row_dl.addWidget(self.lbl_dl_icon)
-        row_dl.addWidget(self.lbl_dl_val)
-        layout.addLayout(row_dl)
-
-        # Row 2: Upload
-        row_ul = QHBoxLayout()
-        row_ul.setContentsMargins(0, 0, 0, 0)
-        row_ul.setSpacing(2)
-
-        self.lbl_ul_icon = QLabel("↑")
-        self.lbl_ul_icon.setStyleSheet("color: #c084fc; font-size: 9px; font-weight: 900;")
-        self.lbl_ul_val = QLabel("0 KB/s")
-        self.lbl_ul_val.setStyleSheet("color: #cdd6f4; font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace; font-size: 9px; font-weight: 600;")
-        row_ul.addWidget(self.lbl_ul_icon)
-        row_ul.addWidget(self.lbl_ul_val)
-        layout.addLayout(row_ul)
-
-    def set_speeds(self, dl_bps: float, ul_bps: float):
-        dl_str = self._format_speed(dl_bps)
-        ul_str = self._format_speed(ul_bps)
-        if self.lbl_dl_val.text() != dl_str:
-            self.lbl_dl_val.setText(dl_str)
-        if self.lbl_ul_val.text() != ul_str:
-            self.lbl_ul_val.setText(ul_str)
-
-    def _format_speed(self, b_s: float) -> str:
-        if b_s < 1024:
-            return f"{b_s:.0f} B/s"
-        elif b_s < 1024 * 1024:
-            return f"{b_s / 1024:.0f} KB/s"
-        elif b_s < 1024 * 1024 * 1024:
-            return f"{b_s / (1024 * 1024):.1f} MB/s"
+    def set_activity(self, level: float):
+        self._led_target = max(0.0, min(1.0, level))
+        if self._clock.enabled:
+            self._kick()
         else:
-            return f"{b_s / (1024 * 1024 * 1024):.2f} GB/s"
+            self._led = self._led_target
+            self.update()
 
-class DualRowBattery(QWidget):
+    def set_value(self, value: float, sub_text: str = "", sub_color: QColor = None):
+        value = max(0.0, min(100.0, float(value)))
+        self.history.append(value)
+        self.target = value
+        self._sub_text = sub_text
+        if sub_color is not None:
+            self._sub_color = QColor(sub_color)
+
+        if not self.has_data:
+            self._display = value
+            self.has_data = True
+        elif self._clock.enabled:
+            if len(self.history) > 1:
+                self._scroll = 1.0
+            self._kick()
+        else:
+            self._display = value
+        self.update()
+
+    def advance(self, dt, animate):
+        if not animate:
+            self._display = self.target
+            self._scroll = 0.0
+            self._phase = 0.0
+            self._led = self._led_target
+            self.update()
+            return AnimationClock.MODE_IDLE
+
+        mode = AnimationClock.MODE_IDLE
+
+        self._display, moving = _ease_towards(self._display, self.target, dt, 11.0, 0.4)
+        if moving:
+            mode = AnimationClock.MODE_FAST
+
+        if self._scroll > 0.0:
+            self._scroll = max(0.0, self._scroll - dt / 0.45)
+            mode = AnimationClock.MODE_FAST
+
+        if self._has_led:
+            self._led, led_moving = _ease_towards(self._led, self._led_target, dt, 8.0, 0.01)
+            if led_moving:
+                mode = AnimationClock.MODE_FAST
+
+        if self.target >= self.crit:
+            self._phase = (self._phase + dt) % 2.0
+            mode = max(mode, AnimationClock.MODE_SLOW)
+        else:
+            self._phase = 0.0
+
+        self.update()
+        return mode
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        gx = self.TAG_W + self.PAD
+        gw = w - gx
+        status = _status_color(self._display, self.warn, self.crit, self.accent)
+
+        # 1. Sparkline (background)
+        n = len(self.history)
+        if n >= 2 and gw > 4:
+            top, bottom = 1.5, h - 3.0
+            step = gw / (self.HISTORY - 1)
+            offset = self._scroll * step
+            path = QPainterPath()
+            first_x = last_x = 0.0
+            for i, v in enumerate(self.history):
+                x = w - (n - 1 - i) * step + offset
+                y = bottom - (v / 100.0) * (bottom - top)
+                if i == 0:
+                    path.moveTo(x, y)
+                    first_x = x
+                else:
+                    path.lineTo(x, y)
+                last_x = x
+            area = QPainterPath(path)
+            area.lineTo(last_x, bottom)
+            area.lineTo(first_x, bottom)
+            area.closeSubpath()
+
+            p.save()
+            p.setClipRect(QRectF(gx, 0, gw, h))
+            fill = QLinearGradient(0, top, 0, bottom)
+            fill.setColorAt(0.0, _qc(status, 50))
+            fill.setColorAt(1.0, _qc(status, 0))
+            p.fillPath(area, fill)
+            p.setPen(QPen(_qc(status, 80), 1.0))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+            p.restore()
+
+        # 2. Load bar (bottom)
+        p.setPen(Qt.NoPen)
+        bar = QRectF(gx, h - 2.0, gw, 2.0)
+        p.setBrush(QColor(255, 255, 255, 20))
+        p.drawRoundedRect(bar, 1, 1)
+        fill_w = gw * self._display / 100.0
+        if fill_w > 0.5:
+            bg = QLinearGradient(gx, 0, gx + gw, 0)
+            bg.setColorAt(0.0, _qc(self.accent, 170))
+            bg.setColorAt(1.0, _qc(status, 255))
+            p.setBrush(bg)
+            p.drawRoundedRect(QRectF(gx, h - 2.0, fill_w, 2.0), 1, 1)
+
+        # 3. Tag pill
+        tag_rect = QRectF(0, 1, self.TAG_W, h - 3)
+        p.setBrush(_qc(self.accent, 40))
+        p.drawRoundedRect(tag_rect, 2.5, 2.5)
+        p.setFont(self._f_tag)
+        p.setPen(self.accent)
+        p.drawText(tag_rect, Qt.AlignCenter, self.tag)
+
+        # Activity LED (disk I/O)
+        if self._has_led and self._led > 0.03:
+            p.setPen(Qt.NoPen)
+            p.setBrush(_qc(C_WHITE, 70 + 185 * self._led))
+            p.drawEllipse(QPointF(self.TAG_W - 2.0, 2.6), 1.6, 1.6)
+
+        # 4. Critical breathing glow behind the value
+        val_rect = QRectF(gx, 0, self.VAL_W, h - 2)
+        if self.target >= self.crit:
+            pulse = 0.5 + 0.5 * math.sin(self._phase * math.pi)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_qc(C_RED, 22 + 48 * pulse))
+            p.drawRoundedRect(val_rect.adjusted(1, 1, 1, 0), 2, 2)
+
+        # 5. Value text
+        txt = f"{self._display:.0f}%" if self.has_data else "--%"
+        txt_color = QColor(C_WHITE) if self._display < self.warn - 5 else status
+        p.setFont(self._f_val)
+        p.setPen(txt_color)
+        p.drawText(val_rect, Qt.AlignVCenter | Qt.AlignRight, txt)
+
+        # 6. Temperature / sub badge
+        if self._show_sub and self._sub_text:
+            sx = gx + self.VAL_W + self.PAD
+            sub_rect = QRectF(sx, 1.5, self.SUB_W, h - 4.5)
+            p.setPen(Qt.NoPen)
+            p.setBrush(_qc(self._sub_color, 34))
+            p.drawRoundedRect(sub_rect, 2, 2)
+            p.setFont(self._f_sub)
+            p.setPen(self._sub_color)
+            p.drawText(sub_rect, Qt.AlignCenter, self._sub_text)
+
+
+class NetRow(AnimatedCell):
+    """
+    Single 15px network line: animated arrow + counting speed + auto-scaled sparkline.
+    The arrow 'kicks' in its flow direction whenever traffic is detected.
+    """
+    H = 15
+    W = 60
+    ICON_W = 10
+    HISTORY = 30
+    ACTIVE_BPS = 2048
+
+    def __init__(self, clock, direction: str, color: str, text_color: str, parent=None):
+        super().__init__(clock, parent)
+        self._dir = 1 if direction == "down" else -1
+        self._glyph = "↓" if direction == "down" else "↑"
+        self.color = QColor(color)
+        self.text_color = QColor(text_color)
+
+        self.history = deque(maxlen=self.HISTORY)
+        self.target = 0.0
+        self._display = 0.0
+        self._scroll = 0.0
+        self._nudge = 0.0
+        self._has_data = False
+
+        self._f_icon = _make_font(10, QFont.Weight.Black)
+        self._f_val = _make_font(9, QFont.Weight.Bold)
+        self.setFixedSize(self.W, self.H)
+
+    def set_speed(self, bps: float):
+        bps = max(0.0, float(bps))
+        self.history.append(bps)
+        self.target = bps
+        if not self._has_data:
+            self._display = bps
+            self._has_data = True
+        elif self._clock.enabled:
+            if len(self.history) > 1:
+                self._scroll = 1.0
+            if bps > self.ACTIVE_BPS:
+                self._nudge = 1.0
+            self._kick()
+        else:
+            self._display = bps
+        self.update()
+
+    def advance(self, dt, animate):
+        if not animate:
+            self._display = self.target
+            self._scroll = 0.0
+            self._nudge = 0.0
+            self.update()
+            return AnimationClock.MODE_IDLE
+
+        mode = AnimationClock.MODE_IDLE
+        snap = max(1.0, self.target * 0.01)
+        self._display, moving = _ease_towards(self._display, self.target, dt, 10.0, snap)
+        if moving:
+            mode = AnimationClock.MODE_FAST
+        if self._scroll > 0.0:
+            self._scroll = max(0.0, self._scroll - dt / 0.45)
+            mode = AnimationClock.MODE_FAST
+        if self._nudge > 0.0:
+            self._nudge = max(0.0, self._nudge - dt / 0.35)
+            mode = AnimationClock.MODE_FAST
+        self.update()
+        return mode
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        gx = self.ICON_W + 1
+        gw = w - gx
+        active = self.target > self.ACTIVE_BPS
+
+        # Sparkline (auto-scaled, floor at 16 KB/s so idle noise stays flat)
+        n = len(self.history)
+        if n >= 2:
+            scale = max(max(self.history), 16 * 1024)
+            top, bottom = 2.0, h - 1.0
+            step = gw / (self.HISTORY - 1)
+            offset = self._scroll * step
+            path = QPainterPath()
+            first_x = last_x = 0.0
+            for i, v in enumerate(self.history):
+                x = w - (n - 1 - i) * step + offset
+                y = bottom - (v / scale) * (bottom - top)
+                if i == 0:
+                    path.moveTo(x, y)
+                    first_x = x
+                else:
+                    path.lineTo(x, y)
+                last_x = x
+            area = QPainterPath(path)
+            area.lineTo(last_x, bottom)
+            area.lineTo(first_x, bottom)
+            area.closeSubpath()
+            p.save()
+            p.setClipRect(QRectF(gx, 0, gw, h))
+            fill = QLinearGradient(0, top, 0, bottom)
+            fill.setColorAt(0.0, _qc(self.color, 38))
+            fill.setColorAt(1.0, _qc(self.color, 0))
+            p.fillPath(area, fill)
+            p.setPen(QPen(_qc(self.color, 60), 1.0))
+            p.drawPath(path)
+            p.restore()
+
+        # Arrow icon (kicks in flow direction on traffic)
+        dy = self._dir * 2.0 * math.sin(self._nudge * math.pi)
+        p.setFont(self._f_icon)
+        p.setPen(_qc(self.color, 255 if active else 115))
+        p.drawText(QRectF(0, dy - 0.5, self.ICON_W, h), Qt.AlignCenter, self._glyph)
+
+        # Speed text
+        p.setFont(self._f_val)
+        p.setPen(self.text_color if active else _qc(self.text_color, 170))
+        p.drawText(QRectF(gx + 1, 0, gw - 1, h), Qt.AlignVCenter | Qt.AlignLeft, _format_speed(self._display))
+
+
+class BatteryRow(AnimatedCell):
     """
     Compact single-line battery widget for row 2.
-    Height: 15px.
+    Height: 15px. Painted battery glyph with animated fill level, charging bolt,
+    and a slow red breathing pulse only when the battery is low and unplugged.
     """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(15)
+    H = 15
+    W = 46
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-
-        self.lbl_icon = QLabel("⚡")
-        self.lbl_icon.setStyleSheet("font-size: 9px; color: #a6e3a1;")
-        layout.addWidget(self.lbl_icon)
-
-        self.lbl_val = QLabel("100%")
-        self.lbl_val.setStyleSheet("color: #a6e3a1; font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace; font-size: 9px; font-weight: 700;")
-        layout.addWidget(self.lbl_val)
+    def __init__(self, clock, parent=None):
+        super().__init__(clock, parent)
+        self.setFixedSize(self.W, self.H)
+        self.percent = 0.0
+        self._display = 0.0
+        self.plugged = False
+        self.secsleft = None
+        self._phase = 0.0
+        self._has_data = False
+        self._f_val = _make_font(9, QFont.Weight.Bold)
 
     def update_battery(self, battery_data: dict):
         if not battery_data:
             self.hide()
             return
+        self.percent = float(battery_data.get("percent", 0) or 0)
+        self.plugged = bool(battery_data.get("power_plugged", False))
+        self.secsleft = battery_data.get("secsleft")
 
-        pct = battery_data.get("percent", 0)
-        plugged = battery_data.get("power_plugged", False)
-
-        self.lbl_icon.setText("⚡" if plugged else "🔋")
-        self.lbl_val.setText(f"{pct:.0f}%")
-
-        if pct < 20 and not plugged:
-            color = "#f38ba8"
-        elif pct < 45 and not plugged:
-            color = "#f9e2af"
+        if not self._has_data or not self._clock.enabled:
+            self._display = self.percent
+            self._has_data = True
         else:
-            color = "#a6e3a1"
-
-        self.lbl_val.setStyleSheet(f"color: {color}; font-family: 'Segoe UI Variable Small', 'Segoe UI', Consolas, monospace; font-size: 9px; font-weight: 700;")
-        self.lbl_icon.setStyleSheet(f"font-size: 9px; color: {color};")
+            self._kick()
+        if self._is_low():
+            self._kick()
+        self.update()
         if not self.isVisible():
             self.show()
+
+    def _is_low(self) -> bool:
+        return self._has_data and self.percent < 20 and not self.plugged
+
+    def _color(self) -> QColor:
+        if self.plugged:
+            return QColor(C_GREEN)
+        if self.percent < 20:
+            return QColor(C_RED)
+        if self.percent < 45:
+            return QColor(C_YELLOW)
+        return QColor(C_GREEN)
+
+    def advance(self, dt, animate):
+        if not animate:
+            self._display = self.percent
+            self._phase = 0.0
+            self.update()
+            return AnimationClock.MODE_IDLE
+        mode = AnimationClock.MODE_IDLE
+        self._display, moving = _ease_towards(self._display, self.percent, dt, 8.0, 0.4)
+        if moving:
+            mode = AnimationClock.MODE_FAST
+        if self._is_low():
+            self._phase = (self._phase + dt) % 2.0
+            mode = max(mode, AnimationClock.MODE_SLOW)
+        elif self._phase:
+            self._phase = 0.0
+        self.update()
+        return mode
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        color = self._color()
+        alpha_mul = 1.0
+        if self._is_low():
+            alpha_mul = 0.55 + 0.45 * (0.5 + 0.5 * math.sin(self._phase * math.pi))
+
+        # Battery body + nub
+        body = QRectF(0.5, 3.5, 15, 8)
+        p.setPen(QPen(_qc(color, 170 * alpha_mul), 1.0))
+        p.setBrush(Qt.NoBrush)
+        p.drawRoundedRect(body, 2, 2)
+        p.setPen(Qt.NoPen)
+        p.setBrush(_qc(color, 170 * alpha_mul))
+        p.drawRoundedRect(QRectF(16.2, 5.8, 1.6, 3.4), 0.6, 0.6)
+
+        # Fill level
+        inner_w = 12.0 * max(0.0, min(100.0, self._display)) / 100.0
+        if inner_w > 0.3:
+            p.setBrush(_qc(color, 235 * alpha_mul))
+            p.drawRoundedRect(QRectF(2.0, 5.0, inner_w, 5.0), 1, 1)
+
+        # Charging bolt
+        if self.plugged:
+            bolt = QPainterPath()
+            bolt.moveTo(9.0, 3.6)
+            bolt.lineTo(5.6, 8.0)
+            bolt.lineTo(7.8, 8.0)
+            bolt.lineTo(6.9, 11.4)
+            bolt.lineTo(10.4, 7.0)
+            bolt.lineTo(8.2, 7.0)
+            bolt.closeSubpath()
+            p.setPen(QPen(QColor(20, 20, 30, 220), 0.8))
+            p.setBrush(QColor(C_WHITE))
+            p.drawPath(bolt)
+
+        # Percentage text
+        p.setFont(self._f_val)
+        p.setPen(_qc(color, 255 * alpha_mul))
+        p.drawText(QRectF(21, 0, self.W - 21, self.H), Qt.AlignVCenter | Qt.AlignLeft,
+                   f"{self._display:.0f}%" if self._has_data else "--%")
+
+
+class TaskbarBridge(QObject):
+    cpu_updated = Signal(dict)
+    memory_updated = Signal(dict)
+    disk_updated = Signal(dict)
+    network_updated = Signal(dict)
+    hardware_updated = Signal(dict)
+    process_updated = Signal(dict)
+
 
 class TaskbarWidget(QWidget):
     """
     Next-Generation Taskbar Mode Monitor.
-    Defaults to Dual-Row layout (height: 36px, width: ~210px) which fits seamlessly
+    Defaults to Dual-Row layout (height: 36px, width: ~250px) which fits seamlessly
     inside the Windows 11 taskbar without covering pinned app icons.
-    Engineered for ultra-low CPU and memory footprint.
+    Engineered for ultra-low CPU and memory footprint:
+      - every cell is custom-painted (no stylesheet re-polish on updates)
+      - one shared animation timer that only runs while something is moving
+      - no QGraphicsEffect (avoids offscreen re-rendering)
     """
     def __init__(self, main_window):
         super().__init__()
@@ -297,9 +875,14 @@ class TaskbarWidget(QWidget):
             "show_disk": True,
             "show_net": True,
             "show_battery": True,
+            "animations": True,
             "view_mode": "dual_row"  # "dual_row", "single_compact", "single_full"
         }
         self._load_settings()
+
+        # Shared animation engine
+        self._clock = AnimationClock(self)
+        self._clock.enabled = bool(self._settings.get("animations", True))
 
         # Telemetry Cache
         self._drag_pos = QPoint()
@@ -332,6 +915,11 @@ class TaskbarWidget(QWidget):
         # Build UI
         self._init_ui()
 
+        # Fade-in animation (only used on explicit entry into taskbar mode)
+        self._fade_anim = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade_anim.setDuration(260)
+        self._fade_anim.setEasingCurve(QEasingCurve.OutCubic)
+
         # Connect Event Bus
         self.bridge = TaskbarBridge()
         self.bridge.cpu_updated.connect(self.update_cpu)
@@ -352,26 +940,20 @@ class TaskbarWidget(QWidget):
         self.container.installEventFilter(self)
 
     def _init_ui(self):
+        self.setStyleSheet(TOOLTIP_QSS)
         root_layout = QHBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Main background container
-        self.container = QWidget()
+        # Main painted glass container
+        self.container = GlassContainer(self._clock)
         self.container.setObjectName("TaskbarContainer")
-        self._apply_container_style()
-
-        # Subtle shadow
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(12)
-        shadow.setColor(QColor(0, 0, 0, 120))
-        shadow.setOffset(0, 1)
-        self.container.setGraphicsEffect(shadow)
+        self.container.set_opacity(self._settings["opacity"])
         root_layout.addWidget(self.container)
 
         # Content Layout
         self.content_layout = QHBoxLayout(self.container)
-        self.content_layout.setContentsMargins(5, 2, 5, 2)
-        self.content_layout.setSpacing(4)
+        self.content_layout.setContentsMargins(5, 2, 4, 2)
+        self.content_layout.setSpacing(5)
 
         # 1. Drag Grip Handle (Left)
         self.grip = DragGrip(self)
@@ -384,14 +966,14 @@ class TaskbarWidget(QWidget):
         layout_col1.setContentsMargins(0, 0, 0, 0)
         layout_col1.setSpacing(1)
 
-        self.item_cpu = DualRowItem("CPU", "#74c7ec", self.col_cpu_ram)
-        self.item_ram = DualRowItem("RAM", "#a6e3a1", self.col_cpu_ram)
-        layout_col1.addWidget(self.item_cpu)
-        layout_col1.addWidget(self.item_ram)
+        self.item_cpu = MetricRow(self._clock, "CPU", C_SKY, warn=60, crit=90, parent=self.col_cpu_ram)
+        self.item_ram = MetricRow(self._clock, "RAM", C_GREEN, warn=75, crit=90, parent=self.col_cpu_ram)
+        layout_col1.addWidget(self.item_cpu, 0, Qt.AlignLeft)
+        layout_col1.addWidget(self.item_ram, 0, Qt.AlignLeft)
         self.content_layout.addWidget(self.col_cpu_ram)
 
         # Divider 1
-        self.div1 = self._create_divider()
+        self.div1 = Divider()
         self.content_layout.addWidget(self.div1)
 
         # 3. Column 2: DSK (Row 1) & Battery (Row 2)
@@ -400,18 +982,26 @@ class TaskbarWidget(QWidget):
         layout_col2.setContentsMargins(0, 0, 0, 0)
         layout_col2.setSpacing(1)
 
-        self.item_dsk = DualRowItem("DSK", "#fab387", self.col_dsk_bat)
-        self.item_bat = DualRowBattery(self.col_dsk_bat)
-        layout_col2.addWidget(self.item_dsk)
-        layout_col2.addWidget(self.item_bat)
+        self.item_dsk = MetricRow(self._clock, "DSK", C_PEACH, warn=85, crit=95, parent=self.col_dsk_bat)
+        self.item_dsk.enable_activity_led()
+        self.item_bat = BatteryRow(self._clock, self.col_dsk_bat)
+        layout_col2.addWidget(self.item_dsk, 0, Qt.AlignLeft)
+        layout_col2.addWidget(self.item_bat, 0, Qt.AlignLeft)
         self.content_layout.addWidget(self.col_dsk_bat)
 
         # Divider 2
-        self.div2 = self._create_divider()
+        self.div2 = Divider()
         self.content_layout.addWidget(self.div2)
 
         # 4. Column 3: Network Bandwidth (Down & Up stacked)
-        self.net_block = DualRowNet(self)
+        self.net_block = QWidget()
+        layout_net = QVBoxLayout(self.net_block)
+        layout_net.setContentsMargins(0, 0, 0, 0)
+        layout_net.setSpacing(1)
+        self.net_dl = NetRow(self._clock, "down", C_NET_DL, C_WHITE, self.net_block)
+        self.net_ul = NetRow(self._clock, "up", C_NET_UL, C_TEXT, self.net_block)
+        layout_net.addWidget(self.net_dl)
+        layout_net.addWidget(self.net_ul)
         self.content_layout.addWidget(self.net_block)
 
         # 5. Quick Restore Button (↗)
@@ -430,7 +1020,7 @@ class TaskbarWidget(QWidget):
             }
             QPushButton:hover {
                 color: #ffffff;
-                background-color: rgba(255, 255, 255, 0.12);
+                background-color: rgba(137, 180, 250, 0.22);
                 border-radius: 3px;
             }
         """)
@@ -440,33 +1030,7 @@ class TaskbarWidget(QWidget):
         self._apply_element_visibility()
 
     def _apply_container_style(self):
-        alpha = int(self._settings["opacity"] * 255)
-        self.container.setStyleSheet(f"""
-            QWidget#TaskbarContainer {{
-                background-color: rgba(18, 18, 26, {alpha});
-                border: 1px solid rgba(255, 255, 255, 0.08);
-                border-top: 1px solid rgba(255, 255, 255, 0.14);
-                border-radius: 6px;
-            }}
-            QWidget#TaskbarContainer:hover {{
-                border-color: rgba(137, 180, 250, 0.35);
-            }}
-        """)
-
-    def _create_divider(self) -> QFrame:
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        divider.setFrameShadow(QFrame.Plain)
-        divider.setFixedWidth(1)
-        divider.setStyleSheet("""
-            QFrame {
-                background-color: rgba(255, 255, 255, 0.08);
-                border: none;
-                margin-top: 4px;
-                margin-bottom: 4px;
-            }
-        """)
-        return divider
+        self.container.set_opacity(self._settings["opacity"])
 
     def _apply_element_visibility(self):
         show_temps = self._settings["show_temps"]
@@ -490,13 +1054,38 @@ class TaskbarWidget(QWidget):
 
         self.adjustSize()
 
-    def _get_temp_color_and_bg(self, temp_val: float) -> tuple[str, str]:
-        if temp_val < 55.0:
-            return ("#a6e3a1", "rgba(166, 227, 161, 0.12)")
-        elif temp_val < 75.0:
-            return ("#f9e2af", "rgba(249, 226, 175, 0.14)")
-        else:
-            return ("#f38ba8", "rgba(243, 139, 168, 0.18)")
+    # Health evaluation
+    def _overall_level(self) -> int:
+        """0 = normal, 1 = high load, 2 = critical. Uses short averages to avoid flicker."""
+        level = 0
+        for row in (self.item_cpu, self.item_ram):
+            if not row.has_data:
+                continue
+            recent = list(row.history)[-3:]
+            v = sum(recent) / len(recent)
+            if v >= row.crit:
+                level = 2
+            elif v >= row.warn:
+                level = max(level, 1)
+        if self._cpu_temp_val >= 85:
+            level = 2
+        elif self._cpu_temp_val >= 75:
+            level = max(level, 1)
+        return level
+
+    def _refresh_status(self):
+        level = self._overall_level()
+        self.grip.set_status_color(QColor((C_GREEN, C_YELLOW, C_RED)[level]))
+
+        # Container alert only on *sustained* critical load (last 5 samples)
+        alert = False
+        for row in (self.item_cpu, self.item_ram):
+            recent = list(row.history)[-5:]
+            if len(recent) >= 5 and min(recent) >= row.crit:
+                alert = True
+        if self._cpu_temp_val >= 88:
+            alert = True
+        self.container.set_alert(alert)
 
     # Updaters
     def update_hardware(self, data: dict):
@@ -533,8 +1122,8 @@ class TaskbarWidget(QWidget):
         if not self.isVisible():
             return
         usage = data.get('usage', 0.0)
-        fg_col, bg_col = self._get_temp_color_and_bg(self._cpu_temp_val)
-        self.item_cpu.set_data(f"{usage:.0f}%", self._cpu_temp_str, fg_col, bg_col)
+        self.item_cpu.set_value(usage, self._cpu_temp_str, _temp_color(self._cpu_temp_val))
+        self._refresh_status()
         # Periodically re-assert topmost without extra timers
         self._force_topmost()
 
@@ -543,8 +1132,7 @@ class TaskbarWidget(QWidget):
         if not self.isVisible():
             return
         pct = data.get('percent', 0.0)
-        fg_col, bg_col = self._get_temp_color_and_bg(self._ram_temp_val)
-        self.item_ram.set_data(f"{pct:.0f}%", self._ram_temp_str, fg_col, bg_col)
+        self.item_ram.set_value(pct, self._ram_temp_str, _temp_color(self._ram_temp_val))
 
     def update_disk(self, data: dict):
         self._cached_disk_data = data
@@ -552,16 +1140,19 @@ class TaskbarWidget(QWidget):
             return
         partitions = data.get("partitions", [])
         pct = partitions[0]['percent'] if partitions else 0.0
-        fg_col, bg_col = self._get_temp_color_and_bg(self._disk_temp_val)
-        self.item_dsk.set_data(f"{pct:.0f}%", self._disk_temp_str, fg_col, bg_col)
+        self.item_dsk.set_value(pct, self._disk_temp_str, _temp_color(self._disk_temp_val))
+
+        # Disk I/O activity LED (0 at idle, full brightness ~8 MB/s+)
+        io = float(data.get("read_speed", 0.0) or 0.0) + float(data.get("write_speed", 0.0) or 0.0)
+        level = 0.0 if io < 64 * 1024 else min(1.0, (io / (8 * 1024 * 1024)) ** 0.5 + 0.25)
+        self.item_dsk.set_activity(level)
 
     def update_network(self, data: dict):
         self._cached_net_data = data
         if not self.isVisible() or not self._settings["show_net"]:
             return
-        dl_bytes = data.get('download_speed', 0.0)
-        ul_bytes = data.get('upload_speed', 0.0)
-        self.net_block.set_speeds(dl_bytes, ul_bytes)
+        self.net_dl.set_speed(data.get('download_speed', 0.0))
+        self.net_ul.set_speed(data.get('upload_speed', 0.0))
 
     def update_process(self, data: dict):
         procs = data.get("processes", [])
@@ -580,23 +1171,124 @@ class TaskbarWidget(QWidget):
         return super().eventFilter(watched, event)
 
     def _generate_tooltip(self):
-        cpu_usage = self._cached_cpu_data.get('usage', 0.0)
-        cpu_freq = self._cached_cpu_data.get('frequency', 0.0)
-        mem_pct = self._cached_mem_data.get('percent', 0.0)
-        total_gb = self._cached_mem_data.get('total', 0) / (1024**3)
-        used_gb = self._cached_mem_data.get('used', 0) / (1024**3)
-        dl_b = self._cached_net_data.get('download_speed', 0.0)
-        ul_b = self._cached_net_data.get('upload_speed', 0.0)
-        dl_fmt = self.net_block._format_speed(dl_b)
-        ul_fmt = self.net_block._format_speed(ul_b)
+        GB = 1024 ** 3
+        cpu = self._cached_cpu_data
+        mem = self._cached_mem_data
+        dsk = self._cached_disk_data
+        net = self._cached_net_data
+        hw = self._cached_hw_data
+
+        def temp_span(val: float, txt: str) -> str:
+            return f"<span style='color:{_temp_color(val).name()};'>{txt}C</span>"
+
+        def row(tag, color, main, extra=""):
+            return (f"<tr><td style='color:{color}; font-weight:700; padding:2px 10px 0 0;'>{tag}</td>"
+                    f"<td style='color:#cdd6f4; padding-top:2px;'>{main}</td>"
+                    f"<td align='right' style='padding:2px 0 0 14px;'>{extra}</td></tr>")
+
+        def sub(text):
+            return (f"<tr><td></td><td colspan='2' style='color:{C_OVERLAY}; font-size:10px; "
+                    f"padding-bottom:3px;'>{text}</td></tr>")
+
+        def stats(hist):
+            h = list(hist)
+            return (sum(h) / len(h), max(h)) if h else (0.0, 0.0)
+
+        rows = []
+
+        # CPU
+        usage = cpu.get('usage', 0.0)
+        freq = cpu.get('frequency', 0.0) or 0.0
+        cores = cpu.get('cores') or '-'
+        threads = cpu.get('threads') or '-'
+        c_avg, c_peak = stats(self.item_cpu.history)
+        rows.append(row("CPU", C_SKY, f"<b>{usage:.0f}%</b> &nbsp;·&nbsp; {freq / 1000:.2f} GHz &nbsp;·&nbsp; {cores}C/{threads}T",
+                        temp_span(self._cpu_temp_val, self._cpu_temp_str)))
+        rows.append(sub(f"Rata-rata 30 dtk {c_avg:.0f}% &nbsp;·&nbsp; puncak {c_peak:.0f}%"))
+
+        # RAM
+        mem_pct = mem.get('percent', 0.0)
+        total_gb = mem.get('total', 0) / GB
+        used_gb = mem.get('used', 0) / GB
+        avail_gb = mem.get('available', 0) / GB
+        r_avg, r_peak = stats(self.item_ram.history)
+        rows.append(row("RAM", C_GREEN, f"<b>{mem_pct:.0f}%</b> &nbsp;·&nbsp; {used_gb:.1f} / {total_gb:.1f} GB",
+                        temp_span(self._ram_temp_val, self._ram_temp_str)))
+        rows.append(sub(f"Tersedia {avail_gb:.1f} GB &nbsp;·&nbsp; rata-rata {r_avg:.0f}% &nbsp;·&nbsp; puncak {r_peak:.0f}%"))
+
+        # Disk
+        parts = dsk.get("partitions", [])
+        if parts:
+            p0 = parts[0]
+            mount = html.escape(str(p0.get('mountpoint', '')).rstrip('\\'))
+            rows.append(row("DSK", C_PEACH,
+                            f"<b>{p0.get('percent', 0):.0f}%</b> &nbsp;·&nbsp; {mount} sisa {_format_bytes(p0.get('free', 0))} dari {_format_bytes(p0.get('total', 0))}",
+                            temp_span(self._disk_temp_val, self._disk_temp_str)))
+            rows.append(sub(f"Baca {_format_speed(dsk.get('read_speed', 0.0) or 0.0)} &nbsp;·&nbsp; "
+                            f"Tulis {_format_speed(dsk.get('write_speed', 0.0) or 0.0)}"
+                            + (f" &nbsp;·&nbsp; {len(parts)} partisi" if len(parts) > 1 else "")))
+
+        # Network
+        dl_b = net.get('download_speed', 0.0)
+        ul_b = net.get('upload_speed', 0.0)
+        dl_peak = max(self.net_dl.history) if self.net_dl.history else 0.0
+        ul_peak = max(self.net_ul.history) if self.net_ul.history else 0.0
+        rows.append(row("NET", C_NET_DL,
+                        f"<span style='color:{C_NET_DL};'>↓</span> {_format_speed(dl_b)} &nbsp; "
+                        f"<span style='color:{C_NET_UL};'>↑</span> {_format_speed(ul_b)}"))
+        totals = ""
+        if net.get('bytes_recv') is not None:
+            totals = f" &nbsp;·&nbsp; total sejak boot ↓ {_format_bytes(net.get('bytes_recv', 0))} ↑ {_format_bytes(net.get('bytes_sent', 0))}"
+        rows.append(sub(f"Puncak 30 dtk ↓ {_format_speed(dl_peak)} ↑ {_format_speed(ul_peak)}{totals}"))
+
+        # Battery
+        batt = hw.get("battery") if hw else None
+        if batt:
+            b_pct = batt.get("percent", 0) or 0
+            secs = batt.get("secsleft")
+            if batt.get("power_plugged"):
+                b_state = "Terisi penuh" if b_pct >= 99 else "Mengisi daya"
+            elif isinstance(secs, (int, float)) and secs > 0:
+                b_state = f"≈ {int(secs // 3600)}j {int(secs % 3600 // 60)}m tersisa"
+            else:
+                b_state = "Menggunakan baterai"
+            rows.append(row("BAT", C_GREEN if b_pct >= 45 or batt.get("power_plugged") else (C_YELLOW if b_pct >= 20 else C_RED),
+                            f"<b>{b_pct:.0f}%</b> &nbsp;·&nbsp; {b_state}"))
+
+        # Status header & uptime
+        level = self._overall_level()
+        status_txt, status_col = [("Normal", C_GREEN), ("Beban Tinggi", C_YELLOW), ("Kritis", C_RED)][level]
+        uptime = ""
+        try:
+            import psutil
+            up = time.time() - psutil.boot_time()
+            d, rem = divmod(int(up), 86400)
+            hrs, rem = divmod(rem, 3600)
+            mins = rem // 60
+            uptime = f"Uptime {d} hari {hrs}j {mins}m" if d else f"Uptime {hrs}j {mins}m"
+        except Exception:
+            pass
 
         tt = f"""
-            <div style="font-family: 'Segoe UI', Arial; font-size: 11px; line-height: 140%;">
-                <b style="color: #74c7ec;">⚡ CPU:</b> {cpu_usage:.0f}% ({cpu_freq:.0f} MHz) | Suhu: {self._cpu_temp_str}C<br>
-                <b style="color: #a6e3a1;">🧠 RAM:</b> {mem_pct:.0f}% ({used_gb:.1f}/{total_gb:.1f} GB) | Suhu: {self._ram_temp_str}C<br>
-                <b style="color: #fab387;">💾 DSK:</b> Suhu: {self._disk_temp_str}C<br>
-                <b style="color: #38bdf8;">↓ DL:</b> {dl_fmt} &nbsp;|&nbsp; <b style="color: #c084fc;">↑ UL:</b> {ul_fmt}<br>
-                <span style="color: #a6adc8;">Top CPU: {self._top_cpu_proc}</span>
+            <div style="font-family: 'Segoe UI', Arial; font-size: 11px;">
+                <table cellspacing="0" cellpadding="0" width="100%">
+                    <tr>
+                        <td style="color:#ffffff; font-weight:700; font-size:12px;">PC System Monitor</td>
+                        <td align="right" style="color:{status_col}; font-weight:700; padding-left:16px;">● {status_txt}</td>
+                    </tr>
+                </table>
+                <div style="color:{C_OVERLAY}; font-size:10px; margin-bottom:4px;">{uptime}</div>
+                <table cellspacing="0" cellpadding="0">
+                    {''.join(rows)}
+                </table>
+                <hr style="border:none; background-color:#313244; height:1px;">
+                <div style="color:{C_SUBTEXT};">
+                    <b style="color:{C_SKY};">Top CPU</b> &nbsp;{html.escape(self._top_cpu_proc)}<br>
+                    <b style="color:{C_GREEN};">Top RAM</b> &nbsp;{html.escape(self._top_mem_proc)}
+                </div>
+                <div style="color:{C_OVERLAY}; font-size:10px; margin-top:4px;">
+                    Klik 2× untuk Dashboard &nbsp;·&nbsp; Klik kanan untuk Opsi
+                </div>
             </div>
         """
         self.container.setToolTip(tt)
@@ -674,15 +1366,38 @@ class TaskbarWidget(QWidget):
     def show_mode(self):
         """Explicit entry into taskbar mode."""
         self._is_active_mode = True
+        if self._clock.enabled:
+            self.setWindowOpacity(0.0)
         self.showNormal()
         self.show()
         self._apply_win32_styles()
         self._force_topmost()
         QTimer.singleShot(20, self.position_in_taskbar)
+        self._replay_cached_metrics()
+        if self._clock.enabled:
+            self._fade_anim.stop()
+            self._fade_anim.setStartValue(0.0)
+            self._fade_anim.setEndValue(1.0)
+            self._fade_anim.start()
+        else:
+            self.setWindowOpacity(1.0)
+
+    def _replay_cached_metrics(self):
+        """Fill the cells immediately with the last known values instead of waiting a tick."""
+        if self._cached_hw_data:
+            self.update_hardware(self._cached_hw_data)
+        if self._cached_cpu_data and not self.item_cpu.has_data:
+            self.update_cpu(self._cached_cpu_data)
+        if self._cached_mem_data and not self.item_ram.has_data:
+            self.update_memory(self._cached_mem_data)
+        if self._cached_disk_data and not self.item_dsk.has_data:
+            self.update_disk(self._cached_disk_data)
 
     def hide_mode(self):
         """Explicit exit from taskbar mode."""
         self._is_active_mode = False
+        self._fade_anim.stop()
+        self._clock.stop()
         try:
             import ctypes
             user32 = ctypes.windll.user32
@@ -692,6 +1407,7 @@ class TaskbarWidget(QWidget):
         except Exception:
             pass
         self.hide()
+        self.setWindowOpacity(1.0)
 
     def restore_window_mode(self):
         self.hide_mode()
@@ -877,6 +1593,13 @@ class TaskbarWidget(QWidget):
         act_t_batt = comp_menu.addAction(f"{'✓ ' if self._settings['show_battery'] else '    '}Baterai (jika ada)")
         act_t_batt.triggered.connect(self._toggle_battery)
 
+        # Animation toggle (power saver)
+        act_anim = menu.addAction(
+            f"{'✓ ' if self._settings.get('animations', True) else '    '}✨ Animasi Halus"
+        )
+        act_anim.setToolTip("Matikan untuk mode hemat daya maksimal")
+        act_anim.triggered.connect(self._toggle_animations)
+
         # Docking submenu
         dock_menu = menu.addMenu("📍  Dock ke Taskbar")
         dock_menu.setStyleSheet(menu.styleSheet())
@@ -935,6 +1658,12 @@ class TaskbarWidget(QWidget):
         self._apply_element_visibility()
         self._save_settings()
         self.position_in_taskbar()
+
+    def _toggle_animations(self):
+        enabled = not self._settings.get("animations", True)
+        self._settings["animations"] = enabled
+        self._clock.set_enabled(enabled)
+        self._save_settings()
 
     def _toggle_lock(self):
         self._settings["locked"] = not self._settings["locked"]
